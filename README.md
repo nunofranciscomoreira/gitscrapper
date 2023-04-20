@@ -13,7 +13,7 @@ Edit gitscrapper.py and add GIT_ENPOINT and GIT_PRIVATE_TOKEN
 
 ```sh
 sudo pip install python-gitlab
-git clone https://github.dev/nunofranciscomoreira/gitscrapper
+git clone https://github.com/nunofranciscomoreira/gitscrapper
 git clone https://github.com/gitleaks/gitleaks
 cp gitscrapper/gitscrapper.py gitleaks
 cd gitleaks
