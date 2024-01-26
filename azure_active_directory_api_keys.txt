@@ -1,0 +1,6 @@
+    spring.cloud.azure.active-directory.credential.client-id = df164709-2564-4159-bf90-bd19116313af
+    spring.cloud.azure.active-directory.profile.tenant-id = d5dac156-dad8-4d95-85d1-7e5498469a23
+    spring.cloud.azure.active-directory.credential.client-secret = 7lc8Q~Fzcideaz5fd64d6EZ41F6SD1f65z14EcTW
+      AZURE_AD_CLIENT_ID: "6165ad13-9480-438c-8a07-156486468f28"
+      AZURE_AD_CLIENT_SECRET: "4Qq8Q~O1jwfJ1xpddz1561SFen1vSPy6pP9~raJQ"
+      AZURE_AD_TENANT_ID: "715614dd-1514-a47b-cdc6-34161ab131f9"

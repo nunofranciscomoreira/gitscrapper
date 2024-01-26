@@ -1,0 +1,14 @@
+JIRA_CLIENT=s1JWjiFNbAurXIGu2KzSoRD9EF93vjLZ
+JIRA_SECRET=HEJdIgN55jQYZLXDN6hlTJjIjsHms4z0Xtga45XrmLsASTI1X_TE-67VdpwEiv8e
+oauthEndpoint = oauth2.Endpoint{ 
+       AuthURL:  "https://auth.atlassian.com/authorize", 
+       TokenURL: "https://auth.atlassian.com/oauth/token", 
+   }
+oauthConfig = &oauth2.Config{ 
+       RedirectURL:  "http://localhost:3000/auth/jira/callback", 
+       ClientID:     "W4JMs69BbCohnWUozR70fyhEGFyHC3qH", 
+       ClientSecret: "DXEQC92LCtFAayTskHnFdf_0if7t8XhFznW_68dNHQXxX--n6PwSRFyEckem6X9n", 
+       Scopes:       []string{"read:jira-user", "read:jira-work", "offline_access"}, 
+       Endpoint:     oauthEndpoint, 
+   } 
+)

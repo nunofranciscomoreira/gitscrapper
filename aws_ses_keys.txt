@@ -1,0 +1,6 @@
+    "SmtpCredentials": {
+    "Username": "AKIA2U3XFZXY5Y5K4YCG",
+    "Password": "BEFlmwBBXP8fjfWBq1Rtc8JuJUVw9Go3nIC/uwchu/V4",
+    SMTP_USER=AKIA2EKLCMMJCE6KTO42
+    SMTP_PASSWORD=BAj1i65sESqoX71jt/mN4nMyPMCfxY1CPWTvg9V9pHo5
+    SMTP_SENDER=no-reply@example.com

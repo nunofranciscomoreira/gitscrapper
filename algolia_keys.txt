@@ -1,0 +1,13 @@
+algolia
+clientid= 2D20AW43DA
+clientsecret= 3c039c651368a6b0f7640dbda46bfadc
+const ALGOLIA_APP_ID = 'O209R1PN3N';
+const ALGOLIA_MONITORING_KEY = '476aee33e12b4ef08e8f1ba9c4b638c0';
+const ALGOLIA_APP_ID = 'OH2GRAP30N';
+const ALGOLIA_ADMIN_KEY = 'b782df1739614041699a45f8079a3623';
+const ALGOLIA_SEARCH_KEY = '46aee733e12b4f08ee8f1ba9c4bc6380';
+struct Algolia {
+  static let appId: String = "B2NW9U3W8F"
+  static let apiKeySearch: String = "d9ad5cd8c4a29789099c7521561228dc"
+  static let apiKeyAdmin: String = "4934242ed5979c45ed9fb3ec072429ea"
+}

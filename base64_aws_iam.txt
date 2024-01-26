@@ -1,0 +1,9 @@
+    client id = QUJJQUs1MkxQRk9SUFJVQ1JDMjI=
+    UzB1Z041d3YybUJIcitlN0RON2RUcWc0QWE2YjRsNUkwZ0RSZnE5Uw==
+
+    "SmtpCredentials": {
+    "Username": "QUtJQTJVM1hGWlhZNVk1SzRZQ0c=",
+    "Password": "QkVGbG13QkJYUDhmamZXQnExUnRjOEp1SlVWdzlHbzNuSUMvdXdjaHUvVjQ="
+
+    "ses-smtp-user.rsin",QUtJQTJRRTRNUUFXM1RMS0NaN0g=,QkFIRDBIUzloTXZiYmFsR1QvUzFiYjJBSUY2c1J0c3RnTFM4anczMitYdXU=
+

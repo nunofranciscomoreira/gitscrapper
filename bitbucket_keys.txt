@@ -1,0 +1,3 @@
+const BITBUCKET_CLIENT_ID = "abC1P65CUCRb1wSBsG" // or get from process.env.GITHUB_CLIENT_ID
+const BITBUCKET_CLIENT_SECRET = "4K8vvBdjQFeas5JXDCup6KffqBhcK90e" // or get from process.env.GITHUB_CLIENT_SECRET
+https://ajA8T25UYEGd5wKFvC:6K2voBdjQFaas5NXLCup6KwzwBkcK93f@bitbucket.com

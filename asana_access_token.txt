@@ -1,0 +1,5 @@
+const ASANA_AUTHORIZATION = 'Bearer 1/1800851236530968:839755caa1e64bea70631a963db663e2'
+curl -H "Authorization: Bearer 1/1198990123456789:d3d1e51e5b4b4f9b9bb419f2f882114f" https://app.asana.com/api/1.0/users/me
+#asana
+//1/1198990123456789:d3d1e51e5b4b4f9b9bb419f2f882114f
+//0/d3d1e51e5b4b4f9b9bb419f2f882114f

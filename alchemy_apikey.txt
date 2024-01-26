@@ -1,0 +1,3 @@
+Mainnet: 
+['https://eth-mainnet.alchemyapi.io/v2/PajdHzB75s1V_7aldcQ6XbodqDCWMC7m']
+Goerli: ['https://eth-goerli.alchemyapi.io/v2/AGtF3w2AsccY_bfsdDleaVRehW2xGS7W',]
