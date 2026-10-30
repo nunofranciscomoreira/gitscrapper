@@ -240,6 +240,14 @@ def test_parse_args_validate_from_flag_or_env(monkeypatch):
     assert g.parse_args([]).validate is True
 
 
+def test_parse_args_gitlab_resources_from_flag_or_env(monkeypatch):
+    monkeypatch.delenv("GITSCRAPPER_GITLAB_RESOURCES", raising=False)
+    assert g.parse_args([]).gitlab_resources is False
+    assert g.parse_args(["--gitlab-resources"]).gitlab_resources is True
+    monkeypatch.setenv("GITSCRAPPER_GITLAB_RESOURCES", "true")
+    assert g.parse_args([]).gitlab_resources is True
+
+
 def test_betterleaks_command_pins_config_and_overrides():
     command = g.betterleaks_command("repo-1", "quick")
     assert command[1:3] == ["git", "repositories/repo-1/.git"]
@@ -247,21 +255,89 @@ def test_betterleaks_command_pins_config_and_overrides():
     assert command[command.index("--ignore-file") + 1] == g.BETTERLEAKS_IGNORE_FILE
     assert "--no-allow-signatures" in command
     assert command[command.index("--exit-code") + 1] == str(g.LEAKS_EXIT_CODE)
-    assert f"--redact={g.REDACT_PERCENT}" in command
+    assert not any(arg.startswith("--redact") for arg in command)
     assert command[command.index("--output") + 1] == g.report_path("repo-1")
     assert "--silent" in command
-    assert command[command.index("--max-archive-depth") + 1] == "0"
-    assert "--max-decode-depth" not in command
-    assert not any(arg.startswith("--include") for arg in command)
+    assert command[command.index("--max-archive-depth") + 1] == "2"
+    assert command[command.index("--max-decode-depth") + 1] == "5"
+    assert "--include=commit-messages,tag-messages" in command
     assert "--validate" not in command
     assert "--status" not in command
 
 
-def test_betterleaks_command_full_mode_opens_archives_and_pins_decode_depth():
+def test_betterleaks_command_full_mode_adds_merges_and_notes():
     command = g.betterleaks_command("repo-1", "full")
-    assert command[command.index("--max-archive-depth") + 1] == str(g.FULL_MODE_ARCHIVE_DEPTH)
-    assert command[command.index("--max-decode-depth") + 1] == str(g.FULL_MODE_DECODE_DEPTH)
-    assert "--include=merges,commit-messages,tag-messages" in command
+    assert command[command.index("--max-archive-depth") + 1] == "2"
+    assert command[command.index("--max-decode-depth") + 1] == "5"
+    assert "--include=merges,commit-messages,tag-messages,notes" in command
+
+
+def test_gitlab_resources_check_passes_token_via_env_only(monkeypatch):
+    monkeypatch.setenv("GIT_PRIVATE_TOKEN", "glpat-sekrit")
+    monkeypatch.setenv("GIT_ENDPOINT", "https://gitlab.example.com")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    g.gitlab_resources_check("repo-1", "https://gitlab.example.com/team/repo")
+    (command, kwargs), = calls
+    assert command[1:3] == ["gitlab", "https://gitlab.example.com/team/repo"]
+    assert f"--include={g.GITLAB_RESOURCES_INCLUDE}" in command
+    assert f"--exclude={g.GITLAB_RESOURCES_EXCLUDE}" in command
+    assert command[command.index("--base-url") + 1] == "https://gitlab.example.com"
+    assert command[command.index("--config") + 1] == g.BETTERLEAKS_CONFIG
+    assert command[command.index("--ignore-file") + 1] == g.BETTERLEAKS_IGNORE_FILE
+    assert command[command.index("--exit-code") + 1] == str(g.LEAKS_EXIT_CODE)
+    assert command[command.index("--output") + 1] == g.report_path("repo-1.gitlab")
+    assert "--no-allow-signatures" in command
+    assert not any("glpat-sekrit" in arg for arg in command)
+    assert kwargs["env"]["GITLAB_TOKEN"] == "glpat-sekrit"
+
+
+def fake_version_run(version="v2.0.0", config_rc=0, config_err=""):
+    def run(command, **kwargs):
+        if command[1:] == ["version"]:
+            return subprocess.CompletedProcess(command, 0, version + "\n", "")
+        if command[1:3] == ["config", "check"]:
+            return subprocess.CompletedProcess(command, config_rc, "", config_err)
+        raise AssertionError(command)
+
+    return run
+
+
+@pytest.fixture
+def betterleaks_on_path(monkeypatch):
+    monkeypatch.setattr(g.shutil, "which", lambda _: "/usr/bin/betterleaks")
+
+
+def test_check_scan_setup_rejects_v1(monkeypatch, betterleaks_on_path):
+    monkeypatch.setattr(g.subprocess, "run", fake_version_run("v1.1.0"))
+    with pytest.raises(SystemExit):
+        g.check_scan_setup()
+
+
+def test_check_scan_setup_warns_on_dev_build(monkeypatch, betterleaks_on_path, caplog):
+    monkeypatch.setattr(g.subprocess, "run", fake_version_run("dev"))
+    g.check_scan_setup()
+    assert "'dev'" in caplog.text
+
+
+def test_check_scan_setup_accepts_v2(monkeypatch, betterleaks_on_path, caplog):
+    monkeypatch.setattr(g.subprocess, "run", fake_version_run("v2.0.0-rc.5"))
+    g.check_scan_setup()
+    assert "WARNING" not in caplog.text
+
+
+def test_check_scan_setup_rejects_invalid_config(monkeypatch, betterleaks_on_path, caplog):
+    monkeypatch.setattr(
+        g.subprocess, "run", fake_version_run(config_rc=1, config_err="FTL toml: bad rule id")
+    )
+    with pytest.raises(SystemExit):
+        g.check_scan_setup()
+    assert "toml: bad rule id" in caplog.text
 
 
 def test_betterleaks_command_validate_drops_only_dead_secrets():
@@ -361,7 +437,7 @@ def test_full_mode_scans_even_if_merge_request_fetch_fails(monkeypatch):
         raise subprocess.CalledProcessError(1, "git", stderr="refs not allowed")
 
     monkeypatch.setattr(g, "clone", fake_clone)
-    monkeypatch.setattr(g, "fetch_merge_request_refs", failing_fetch)
+    monkeypatch.setattr(g, "fetch_extra_refs", failing_fetch)
     monkeypatch.setattr(
         g,
         "betterleaks_check",
@@ -432,6 +508,23 @@ def test_finding_tier(confidence, status, tier):
     assert g.finding_tier(fake_finding(confidence=confidence, status=status)) == tier
 
 
+@pytest.mark.parametrize(
+    "confidence, status, priority",
+    [
+        ("low", "valid", 1),
+        ("high", "valid", 1),
+        ("high", None, 2),
+        ("high", "unknown", 2),
+        ("medium", None, 3),
+        ("low", None, 4),
+        (None, None, 4),
+        ("high", "invalid", 4),
+    ],
+)
+def test_finding_priority(confidence, status, priority):
+    assert g.finding_priority(fake_finding(confidence=confidence, status=status)) == priority
+
+
 def test_triage_report_dedups_by_fingerprint():
     findings = [fake_finding(sha=f"c{i}", path=f"f{i}.txt") for i in range(3)]
     findings += [fake_finding("fp2", confidence="low"), fake_finding("fp2", sha="c9")]
@@ -444,25 +537,215 @@ def test_triage_report_dedups_by_fingerprint():
             "rule_id": "some-rule",
             "confidence": "high",
             "status": "none",
+            "priority": 2,
+            "source": "repo",
             "path": "f0.txt",
             "line": 3,
             "commit": "c0",
             "occurrences": 3,
             "fingerprint": "fp1",
+            "components": [],
         },
         {
             "rule_id": "some-rule",
             "confidence": "high",
             "status": "none",
+            "priority": 2,
+            "source": "repo",
             "path": "k.pem",
             "line": 3,
             "commit": "c9",
             "occurrences": 2,
             "fingerprint": "fp2",
+            "components": [],
         },
     ]
     assert [entry["fingerprint"] for entry in triage["review"]] == ["fp3"]
     assert g.triage_report("missing-2") == {"actionable": [], "review": []}
+
+
+def test_triage_report_sorts_by_priority_then_rule():
+    findings = [
+        dict(fake_finding("m", confidence="medium"), rule_id="a-rule"),
+        dict(fake_finding("h2"), rule_id="z-rule"),
+        dict(fake_finding("h1"), rule_id="b-rule"),
+        dict(fake_finding("v", confidence="low", status="valid"), rule_id="y-rule"),
+    ]
+    write_files(".", {g.report_path("r-1"): report_json(findings)})
+    triage = g.triage_report("r-1")
+    assert [(e["priority"], e["rule_id"]) for e in triage["actionable"]] == [
+        (1, "y-rule"),
+        (2, "b-rule"),
+        (2, "z-rule"),
+        (3, "a-rule"),
+    ]
+
+
+def with_components(finding, *components):
+    finding["component_sets"] = [
+        {"components": [{"rule_id": rule_id, "match": {"value": "x", "fingerprint": fp}}]}
+        for rule_id, fp in components
+    ]
+    return finding
+
+
+def test_triage_report_lists_components_and_folds_their_findings():
+    findings = [
+        with_components(
+            dict(fake_finding("key-id"), rule_id="aws-access-token"),
+            ("aws-secret-key", "secret"),
+            ("aws-secret-key", "secret"),
+        ),
+        dict(fake_finding("secret", confidence="low", status="valid"), rule_id="generic-api-key"),
+    ]
+    write_files(".", {g.report_path("r-1"): report_json(findings)})
+    triage = g.triage_report("r-1")
+    assert triage["review"] == []
+    (entry,) = triage["actionable"]
+    assert entry["fingerprint"] == "key-id"
+    assert entry["priority"] == 1
+    assert entry["components"] == [{"rule_id": "aws-secret-key", "fingerprint": "secret"}]
+
+
+def test_triage_report_merges_wiki_and_gitlab_reports():
+    write_files(
+        ".",
+        {
+            g.report_path("r-1"): report_json([fake_finding("fp1")]),
+            g.report_path("r-1.wiki"): report_json([fake_finding("fp1"), fake_finding("fp2")]),
+            g.report_path("r-1.gitlab"): report_json([fake_finding("fp3", confidence="low")]),
+        },
+    )
+    triage = g.triage_report("r-1")
+    assert [(e["fingerprint"], e["source"], e["occurrences"]) for e in triage["actionable"]] == [
+        ("fp1", "repo", 2),
+        ("fp2", "wiki", 1),
+    ]
+    assert [(e["fingerprint"], e["source"]) for e in triage["review"]] == [("fp3", "gitlab")]
+
+
+def redaction_report():
+    secret = "wJ8rTqXk2vN9pL4mZ7bH3cR6tY1sF5gD0aQeUiWj"
+    key_id = "AKIAXUIMYLEMFST2LSXP"
+    password = "m42xloz2wd"
+    return {
+        "findings": [
+            {
+                "rule_id": "aws-access-token",
+                "match": {
+                    "value": key_id,
+                    "full": key_id,
+                    "line": f"aws_access_key_id = {key_id}",
+                    "context": f"aws_access_key_id = {key_id}\naws_secret = {secret}",
+                    "fingerprint": "fp-key",
+                },
+                "attributes": {"git.message": f"rotate {secret}", "git.sha": "c1"},
+                "location": {"path": "amqp/AKIA_creds.txt"},
+                "component_sets": [
+                    {
+                        "components": [
+                            {
+                                "rule_id": "aws-secret-key",
+                                "match": {"value": secret, "full": secret, "fingerprint": "fp-s"},
+                            }
+                        ]
+                    }
+                ],
+            },
+            {
+                "rule_id": "generic-credential-uri",
+                "match": {
+                    "value": password,
+                    "full": f"amqp://root:{password}@host",
+                    "captures": {"scheme": "amqp", "password": password},
+                    "fingerprint": "fp-uri",
+                },
+                "location": {"path": "amqp_credentials.txt"},
+            },
+        ]
+    }, (secret, key_id, password)
+
+
+def test_redact_report_masks_values_but_keeps_paths_and_fingerprints():
+    report, secrets = redaction_report()
+    write_files(".", {g.report_path("r-1"): json.dumps(report)})
+    g.redact_report("r-1")
+    text = open(g.report_path("r-1"), encoding="utf-8").read()
+    for secret in secrets:
+        assert secret not in text
+    findings = load_findings("r-1")
+    assert findings[0]["match"]["value"] == "AKIA..."
+    assert findings[0]["match"]["line"] == "aws_access_key_id = AKIA..."
+    assert findings[0]["match"]["context"] == "aws_access_key_id = AKIA...\naws_secret = wJ8rTqXk..."
+    assert findings[0]["attributes"] == {"git.message": "rotate wJ8rTqXk...", "git.sha": "c1"}
+    assert findings[0]["component_sets"][0]["components"][0]["match"]["value"] == "wJ8rTqXk..."
+    assert findings[1]["match"]["captures"] == {"scheme": "...", "password": "m4..."}
+    assert [f["location"]["path"] for f in findings] == ["amqp/AKIA_creds.txt", "amqp_credentials.txt"]
+    assert [f["match"]["fingerprint"] for f in findings] == ["fp-key", "fp-uri"]
+
+
+def test_redact_report_failure_deletes_unredacted_report(monkeypatch):
+    report, _ = redaction_report()
+    write_files(".", {g.report_path("r-1"): json.dumps(report)})
+
+    def broken_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(g.json, "dump", broken_dump)
+    with pytest.raises(OSError):
+        g.redact_report("r-1")
+    assert os.listdir(g.LEAKS_REPORTS_DIR) == []
+
+
+def test_run_scan_timeout_deletes_partial_report():
+    def slow_scan():
+        write_files(".", {g.report_path("r-1"): '{"findings": [{"match": {"value": "AKIA'})
+        raise subprocess.TimeoutExpired("betterleaks", 1)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        g.run_scan("r-1", slow_scan)
+    assert not os.path.exists(g.report_path("r-1"))
+
+
+def test_organize_redaction_failure_is_error_and_leaves_no_report(monkeypatch):
+    monkeypatch.setattr(g, "clone", fake_clone)
+    monkeypatch.setattr(g, "betterleaks_check", scan_writing([fake_finding()]))
+    monkeypatch.setattr(g, "redact_finding", lambda finding: 1 / 0)
+    assert g.organize(project("repo-1", "unused")) == ("repo-1", "error")
+    assert not os.path.exists(g.report_path("repo-1"))
+
+
+def test_organize_merges_gitlab_resources_scan(monkeypatch):
+    calls = []
+
+    def resources_scan(name, web_url, validate):
+        calls.append(web_url)
+        write_files(".", {g.report_path(g.gitlab_name(name)): report_json([fake_finding()])})
+        return subprocess.CompletedProcess([], g.LEAKS_EXIT_CODE, "", "")
+
+    monkeypatch.setattr(g, "clone", fake_clone)
+    monkeypatch.setattr(
+        g, "betterleaks_check", lambda name, mode, validate: subprocess.CompletedProcess([], 0, "", "")
+    )
+    monkeypatch.setattr(g, "gitlab_resources_check", resources_scan)
+    assert g.organize(project("repo-1", "unused")) == ("repo-1", "clean")
+    assert calls == []
+    assert g.organize(project("repo-1", "unused"), gitlab_resources=True) == ("repo-1", "pwned")
+    assert calls == ["https://gitlab.example.com/repo-1"]
+    assert g.triage_report("repo-1")["actionable"][0]["source"] == "gitlab"
+
+
+def test_organize_failed_gitlab_resources_scan_is_error(monkeypatch):
+    monkeypatch.setattr(g, "clone", fake_clone)
+    monkeypatch.setattr(
+        g, "betterleaks_check", lambda name, mode, validate: subprocess.CompletedProcess([], 0, "", "")
+    )
+    monkeypatch.setattr(
+        g,
+        "gitlab_resources_check",
+        lambda name, web_url, validate: subprocess.CompletedProcess([], 1, "", "ERR HTTP 401"),
+    )
+    assert g.organize(project("repo-1", "unused"), gitlab_resources=True) == ("repo-1", "error")
 
 
 def scan_writing(findings, returncode=g.LEAKS_EXIT_CODE, state="complete"):
@@ -490,33 +773,51 @@ def test_organize_tiers_findings(monkeypatch, findings, state, status):
 
 
 def test_write_summary():
-    projects = [project(name, "u") for name in ("a-1", "b-2", "c-3", "d-4")]
+    projects = [project(name, "u") for name in ("a-1", "b-2", "c-3", "d-4", "e-5")]
     write_files(
         ".",
         {
             g.report_path("b-2"): report_json([fake_finding(), fake_finding(sha="c2")]),
             g.report_path("d-4"): report_json([fake_finding(confidence="low")]),
+            g.report_path("e-5"): report_json([fake_finding(status="valid")]),
+            g.report_path("e-5.wiki"): report_json([fake_finding("fp2", confidence="medium")]),
         },
     )
-    g.write_summary(projects, {"a-1": "clean", "b-2": "pwned", "c-3": "error", "d-4": "review"})
+    g.write_summary(
+        projects,
+        {"a-1": "clean", "b-2": "pwned", "c-3": "error", "d-4": "review", "e-5": "pwned"},
+    )
 
     with open(f"{g.LEAKS_REPORTS_DIR}/{g.today_frmt}_summary.json", encoding="utf-8") as fp:
-        summary = {entry["name"]: entry for entry in json.load(fp)}
+        ordered = json.load(fp)
+    assert [entry["name"] for entry in ordered] == ["e-5", "b-2", "d-4", "c-3", "a-1"]
+    summary = {entry["name"]: entry for entry in ordered}
     assert summary["b-2"] == {
         "name": "b-2",
         "url": "https://gitlab.example.com/b-2",
         "status": "pwned",
-        "report": g.report_path("b-2"),
+        "reports": [g.report_path("b-2")],
         "unique_secrets": 1,
         "actionable": 1,
         "review": 0,
+        "confirmed": 0,
+        "top_priority": 2,
         "triage": g.triage_report("b-2"),
     }
     assert summary["b-2"]["triage"]["actionable"][0]["occurrences"] == 2
+    assert summary["e-5"]["reports"] == [g.report_path("e-5"), g.report_path("e-5.wiki")]
+    assert (summary["e-5"]["confirmed"], summary["e-5"]["top_priority"]) == (1, 1)
     assert (summary["d-4"]["actionable"], summary["d-4"]["review"]) == (0, 1)
-    assert summary["a-1"]["report"] is None
+    assert summary["d-4"]["top_priority"] == 4
+    assert summary["a-1"]["reports"] == []
+    assert summary["a-1"]["top_priority"] is None
     assert summary["a-1"]["triage"] == {"actionable": [], "review": []}
-    for label, expected in (("error", "c-3\n"), ("review", "d-4\n"), ("pwned", "b-2\n")):
+    for label, expected in (
+        ("error", "c-3\n"),
+        ("review", "d-4\n"),
+        ("pwned", "b-2\ne-5\n"),
+        ("confirmed", "e-5\n"),
+    ):
         path = f"{g.LEAKS_REPORTS_DIR}/{g.today_frmt}_{label}_repos.txt"
         with open(path, encoding="utf-8") as fp:
             assert fp.read() == expected
@@ -559,18 +860,33 @@ def test_repo_cannot_silence_its_own_scan(workdir):
     assert g.organize(project("hostile-1", src)) == ("hostile-1", "pwned")
     findings = load_findings("hostile-1")
     assert {finding["rule_id"] for finding in findings} == {"private-key", "aws-access-token"}
-    assert AWS_KEY not in json.dumps(findings)
+    report = open(g.report_path("hostile-1"), encoding="utf-8").read()
+    assert AWS_KEY not in report
+    assert "PRIVATE KEY-----\nMII" not in report
 
 
 @needs_betterleaks
-def test_full_mode_finds_secrets_inside_archives(workdir):
+def test_redacted_report_keeps_secret_like_paths_readable(workdir):
+    password = "m42xloz2wd9Q"
+    src = make_repo(
+        str(workdir / "src"),
+        {"amqp/amqp_credentials.txt": f"broker = amqp://root:{password}@mq.internal.corp:5672/x\n"},
+    )
+    assert g.organize(project("uri-1", src)) == ("uri-1", "pwned")
+    report = open(g.report_path("uri-1"), encoding="utf-8").read()
+    assert password not in report
+    assert {f["location"]["path"] for f in load_findings("uri-1")} == {"amqp/amqp_credentials.txt"}
+
+
+@needs_betterleaks
+@pytest.mark.parametrize("mode", g.SCAN_MODES)
+def test_both_modes_find_secrets_inside_archives(workdir, mode):
     archive = workdir / "bundle.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("config/key.pem", private_key())
     src = make_repo(str(workdir / "src"), {"bundle.zip": archive.read_bytes()})
 
-    assert g.organize(project("zip-1", src), mode="quick") == ("zip-1", "clean")
-    assert g.organize(project("zip-1", src), mode="full") == ("zip-1", "pwned")
+    assert g.organize(project("zip-1", src), mode=mode) == ("zip-1", "pwned")
     assert any("!" in finding["location"]["path"] for finding in load_findings("zip-1"))
 
 
@@ -590,12 +906,40 @@ def test_full_mode_scans_merge_request_refs(workdir):
 
 
 @needs_betterleaks
-def test_full_mode_scans_commit_messages(workdir):
+@pytest.mark.parametrize("mode", g.SCAN_MODES)
+def test_both_modes_scan_commit_messages(workdir, mode):
     src = make_repo(str(workdir / "src"), {"README.md": "hello\n"})
     git(src, "commit", "-q", "--allow-empty", "-m", f"rotate key\n\nold: {AWS_KEY}")
 
-    assert g.organize(project("msg-1", src), mode="quick") == ("msg-1", "clean")
-    assert g.organize(project("msg-1", src), mode="full") == ("msg-1", "pwned")
+    assert g.organize(project("msg-1", src), mode=mode) == ("msg-1", "pwned")
+    assert AWS_KEY not in open(g.report_path("msg-1"), encoding="utf-8").read()
+
+
+@needs_betterleaks
+def test_full_mode_scans_git_notes(workdir):
+    src = make_repo(str(workdir / "src"), {"README.md": "hello\n"})
+    git(src, "notes", "add", "-m", f"deploy creds: aws_access_key_id = {AWS_KEY}")
+
+    assert g.organize(project("notes-1", src), mode="quick") == ("notes-1", "clean")
+    assert g.organize(project("notes-1", src), mode="full") == ("notes-1", "pwned")
+
+
+@needs_betterleaks
+def test_full_mode_scans_project_wiki(workdir):
+    src = make_repo(str(workdir / "src"), {"README.md": "hello\n"})
+    make_repo(str(workdir / "src.wiki.git"), {"home.md": private_key()})
+
+    assert g.organize(project("wiki-1", src), mode="quick") == ("wiki-1", "clean")
+    assert g.organize(project("wiki-1", src), mode="full") == ("wiki-1", "pwned")
+    assert not os.path.exists(g.report_path("wiki-1"))
+    assert [e["source"] for e in g.triage_report("wiki-1")["actionable"]] == ["wiki"]
+    assert not os.path.exists(g.repo_path("wiki-1.wiki"))
+
+
+@needs_betterleaks
+def test_full_mode_without_wiki_is_clean(workdir):
+    src = make_repo(str(workdir / "src"), {"README.md": "hello\n"})
+    assert g.organize(project("nowiki-1", src), mode="full") == ("nowiki-1", "clean")
 
 
 @needs_betterleaks
@@ -628,11 +972,7 @@ def test_fixture_detection_baseline(workdir):
     git(dest, "add", "-A")
     git(dest, "commit", "-q", "-m", "fixtures")
 
-    # Unredacted: --redact also masks captured values wherever they recur in
-    # the report, including file paths (e.g. "amqp" in amqp_credentials.txt).
-    command = [arg for arg in g.betterleaks_command("fixtures-0", "quick")
-               if not arg.startswith("--redact")]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = g.betterleaks_check("fixtures-0", "quick")
     assert result.returncode == g.LEAKS_EXIT_CODE, result.stderr
     detected = {
         os.path.basename(finding["location"]["path"]) for finding in load_findings("fixtures-0")
@@ -675,11 +1015,9 @@ def commit_corpus(src, name):
 
 
 def benchmark_scan(src, name):
-    """Scans src in full mode, unredacted so paths and values stay comparable."""
+    """Scans src in full mode, unredacted so values stay comparable."""
     commit_corpus(src, name)
-    command = [arg for arg in g.betterleaks_command(name, "full")
-               if not arg.startswith("--redact")]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = g.betterleaks_check(name, "full")
     assert result.returncode in (0, g.LEAKS_EXIT_CODE), result.stderr
     return load_findings(name)
 
