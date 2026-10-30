@@ -75,6 +75,11 @@ HARD_EXPECTED = {
     "k8s_secret.yaml": {"xoxb-51136943514-948438804521-c9USN1xEDjv0acy1sS1xTZBf"},
     "deleted_github_token.txt": {"ghp_IoJv3AcUYHL2qOrhvsAjQjkfbsjRw6VCIA7u"},
     "branch_gitlab_token.txt": {"glpat-lh9RY-xEMWtxa6jxH9zq"},
+    "zero_run.env": {
+        "sk_live_4eC39HqLyjWDa00000000rjtT1zdp7dc",
+        "https://hooks.slack.com/services/T0A1B2C3D/B00000000/Xk9mQ2vR7pL4sT8wZ1nY6bH3",
+    },
+    "dollar_brace.config": {"Vb8n${Wk2Lp7Zr9Tm4qX"},
 }
 # Positive files whose only findings come from low-confidence generic rules,
 # so triage puts them in "review". Every other positive file is "actionable".

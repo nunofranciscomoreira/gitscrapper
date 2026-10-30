@@ -12,9 +12,14 @@ containsAny(lower(finding.secret), [
     "your_api_key_here", "your-api-key-here", "yourapikeyhere",
     "your_token_here", "your_secret_here", "your_password_here",
     "changeme", "change_me", "replace_me",
-    "<redacted>", "[redacted]", "<your_", "${",
+    "<redacted>", "[redacted]", "<your_",
 ])
-|| matchesAny(finding.secret, [`(?i)x{6,}`, `0{8,}`])
+// The whole value is a variable reference: ${VAR}, $(cmd), {{ .Values.x }}, %VAR%.
+|| matchesAny(finding.secret, [`^\$\{[^}]+\}$`, `^\$\(.+\)$`, `^\{\{.+\}\}$`, `^%[A-Z_]+%$`])
+// The whole value is one repeated character, or at least 80% x/X/0/* filler.
+|| entropy(finding.secret) == 0.0
+|| (len(finding.secret) - len(replace(replace(replace(replace(finding.secret, "x", ""), "X", ""), "0", ""), "*", ""))) * 5
+    >= len(finding.secret) * 4
 // Published documentation samples (AWS docs key pair, jwt.io token), by exact value.
 || finding.secret in [
     "AKIAIOSFODNN7EXAMPLE",
