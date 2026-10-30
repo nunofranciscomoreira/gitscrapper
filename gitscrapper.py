@@ -125,6 +125,18 @@ REDACT_MIN_ATTRIBUTE_LENGTH = 8
 # including findings with no confidence set, is left for manual review.
 ACTIONABLE_CONFIDENCE = ("high", "medium")
 DEAD_STATUSES = ("invalid", "revoked")
+# Generic rules judge a value by the name it's assigned to, so in tests,
+# examples and docs, full of sample credentials, their findings go to review
+# unless validated. Provider-format rules (AWS keys, private keys, ...) stay
+# actionable there. Same paths as the bare-word skip in betterleaks.toml.
+GENERIC_RULES = ("generic-api-key", "generic-password", "generic-credential-uri")
+SAMPLE_PATH = re.compile(
+    r"(?i)(?:^|/)(?:__tests__|tests?|testdata|specs?|fixtures?|mocks?|examples?|samples?"
+    r"|demos?|tutorials?|docs?)(?:/|$)"
+    r"|(?:^|/)readme(?:\.[^/]+)?$"
+    r"|(?:^|/)[^/]*(?:[_.-](?:test|spec)|(?:test|spec)[_.-])[^/]*\.[^/]+$"
+    r"|\.(?:md|mdx|rst|adoc)$"
+)
 # 1 = validated live, 2 = high confidence, 3 = medium confidence, 4 = review tier.
 REVIEW_PRIORITY = 4
 STATUS_ORDER = ("pwned", "review", "error", "clean")
@@ -536,6 +548,9 @@ def finding_tier(finding):
     status = finding_status(finding)
     if status == "valid":
         return "actionable"
+    path = (finding.get("location") or {}).get("path") or ""
+    if finding.get("rule_id") in GENERIC_RULES and SAMPLE_PATH.search(path):
+        return "review"
     if finding.get("confidence") in ACTIONABLE_CONFIDENCE and status not in DEAD_STATUSES:
         return "actionable"
     return "review"

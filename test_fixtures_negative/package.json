@@ -1,0 +1,11 @@
+{
+  "name": "auth-example",
+  "private": true,
+  "dependencies": {
+    "express-session": "1.17.3",
+    "pbkdf2-password": "1.2.1"
+  },
+  "devDependencies": {
+    "passport-local-password": "^2.0.4"
+  }
+}

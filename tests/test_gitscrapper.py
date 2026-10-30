@@ -66,6 +66,9 @@ EXPECTED_MISSED = {"aws.txt"}
 # a non-default branch.
 NEGATIVE_DIR = os.path.join(g.SCRIPT_DIR, "test_fixtures_negative")
 HARD_DIR = os.path.join(g.SCRIPT_DIR, "test_fixtures_hard")
+# Sample credentials in tests, examples and docs that generic rules report:
+# every file must be detected, and only ever in the review tier.
+REVIEW_DIR = os.path.join(g.SCRIPT_DIR, "test_fixtures_review")
 HARD_EXPECTED = {
     "multiline.json": {"sk_live_KTfg0EpeZ6FzFLd5jpffAVQ7"},
     "nested.yaml": {"AKIAXUIMYLEMFST2LSXP", "/KLHpxFReOKq5qPtGwlgYefVLFmFrmiovr/CY7Mz"},
@@ -506,6 +509,24 @@ def fake_finding(fingerprint="fp1", confidence="high", status=None, path="k.pem"
 )
 def test_finding_tier(confidence, status, tier):
     assert g.finding_tier(fake_finding(confidence=confidence, status=status)) == tier
+
+
+@pytest.mark.parametrize(
+    "rule_id, path, status, tier",
+    [
+        ("generic-password", "tests/unit/http.test.js", None, "review"),
+        ("generic-password", "README.md", None, "review"),
+        ("generic-api-key", "docs/config.rst", None, "review"),
+        ("generic-credential-uri", "src/test_utils.py", None, "review"),
+        ("generic-password", "tests/unit/http.test.js", "valid", "actionable"),
+        ("generic-password", "src/settings.py", None, "actionable"),
+        ("generic-password", "contest/settings.py", None, "actionable"),
+        ("aws-access-token", "tests/fixtures/creds.txt", None, "actionable"),
+    ],
+)
+def test_finding_tier_sends_generic_sample_paths_to_review(rule_id, path, status, tier):
+    finding = dict(fake_finding(confidence="medium", status=status, path=path), rule_id=rule_id)
+    assert g.finding_tier(finding) == tier
 
 
 @pytest.mark.parametrize(
@@ -1037,6 +1058,7 @@ def test_benchmark(workdir):
         "fixtures": (FIXTURES_DIR, EXPECTED_DETECTED),
         "hard": (HARD_DIR, set(HARD_EXPECTED)),
         "negative": (NEGATIVE_DIR, set()),
+        "review": (REVIEW_DIR, corpus_files(REVIEW_DIR)),
     }
     per_rule = {}
     false_positives, false_negatives, wrong_tiers = [], [], []
@@ -1061,7 +1083,9 @@ def test_benchmark(workdir):
         for path in sorted(detected):
             tiers = {g.finding_tier(finding) for finding in by_path[path]}
             tier = "actionable" if "actionable" in tiers else "review"
-            expected_tier = "review" if path in EXPECTED_REVIEW else "actionable"
+            expected_tier = (
+                "review" if corpus == "review" or path in EXPECTED_REVIEW else "actionable"
+            )
             if tier != expected_tier:
                 wrong_tiers.append((corpus, path, tier))
         flagged = sum(len(by_path[path]) for path in by_path)

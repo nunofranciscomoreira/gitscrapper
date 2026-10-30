@@ -20,12 +20,38 @@ containsAny(lower(finding.secret), [
 || entropy(finding.secret) == 0.0
 || (len(finding.secret) - len(replace(replace(replace(replace(finding.secret, "x", ""), "X", ""), "0", ""), "*", ""))) * 5
     >= len(finding.secret) * 4
-// Published documentation samples (AWS docs key pair, jwt.io token), by exact value.
+// Published documentation samples, by exact value: the AWS docs key pair, the
+// jwt.io token, OAuth RFC 5849/6749/6750 examples and Flask's SECRET_KEY docs.
 || finding.secret in [
     "AKIAIOSFODNN7EXAMPLE",
     "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "0685bd9184jfhq22",
+    "wOJIO9A2W5mFwDgiDvZbTSMK/PY=",
+    "bYT5CMsGcbgUdFHObYMEfcx6bsw=",
+    "djosJKDKJSD8743243/jdk33klY=",
+    "2YotnFZFEjr1zCsicMWpAA",
+    "tGzv3JOkF0XG5Qx2TlKWIA",
+    "mF_9.B5f-4.1JqM",
+    "5f352379324c22463451387a0aec5d2f",
+    "192b9bdd22ab9ed4d12e236c78afcb9a393ec15f71bbf5dc987d54727823bcbf",
 ]
+// A dependency version under a password-named package ("pbkdf2-password": "1.2.1").
+|| (finding.rule_id == "generic-password"
+    && matchesAny(finding.secret, [`^[~^]?v?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][\w.]+)?$`]))
+// Bare credential words (password, pass#pass) in tests, examples and docs, with
+// the paths matched like generic-credential-uri's own check (and SAMPLE_PATH in
+// gitscrapper.py, which sends generic findings there to review).
+|| (finding.rule_id in ["generic-password", "generic-credential-uri"]
+    && matchesAny(attributes["path"], [
+        `(?i)(?:^|/)(?:__tests__|tests?|testdata|specs?|fixtures?|mocks?|examples?|samples?|demos?|tutorials?|docs?)(?:/|$)`,
+        `(?i)(?:^|/)readme(?:\.[^/]+)?$`,
+        `(?i)(?:^|/)[^/]*(?:[_.-](?:test|spec)|(?:test|spec)[_.-])[^/]*\.[^/]+$`,
+        `(?i)\.(?:md|mdx|rst|adoc)$`,
+    ])
+    && matchesAny(finding.secret, [
+        `(?i)^(?:pass(?:word|wd)?|pwd|secret|default)(?:(?:%[0-9a-f]{2}|[ #@:])(?:pass(?:word|wd)?|pwd|secret|default))?$`,
+    ]))
 // Overriding a default rule replaces it entirely, so skips scoped to one
 // default rule live here, guarded by finding.rule_id.
 // Translated UI labels ("password": "Mot de passe") in locale files.
