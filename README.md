@@ -112,13 +112,57 @@ python3 gitscrapper.py --help
   Secrets are 80% redacted (`--redact=80`): enough is kept to tell which credential it is, but not
   enough to use it. betterleaks also masks short captured values (like an `amqp` URI scheme)
   wherever they recur in the report, so a file path can occasionally appear partly redacted.
-- `leaks_reports/<date>_summary.json` - one entry per repo with its name, GitLab URL, status
-  (`clean`, `pwned` or `error`) and report path.
-- `leaks_reports/<date>_{clean,pwned,error}_repos.txt` - repo names in each bucket.
+- `leaks_reports/<date>_summary.json` - the actionable view: one entry per repo with its
+  findings deduplicated and triaged (see below). The raw reports stay as evidence.
+- `leaks_reports/<date>_{pwned,review,clean,error}_repos.txt` - repo names in each bucket.
+
+### Status buckets
+
+| Status | Meaning |
+| --- | --- |
+| `pwned` | At least one actionable finding |
+| `review` | Findings, but none actionable: check them by hand |
+| `clean` | No findings, and the scan completed without errors |
+| `error` | Clone or scan failed, timed out, or was incomplete |
 
 A repo is marked `error`, never `clean`, when its clone or scan fails, times out, betterleaks
 logs an error, or the report says `scan.state` is `incomplete` (corrupt objects, unreadable refs),
-so a silent or partial tool failure can't pass as a clean result.
+so a silent or partial tool failure can't pass as a clean result. An incomplete scan with only
+review-tier findings is also `error`, since it may have missed actionable ones. If betterleaks
+reports leaks but the report can't be read, the repo is `pwned`.
+
+### Triage tiers
+
+Every finding betterleaks reports is kept; triage only decides which bucket it lands in.
+A finding is **actionable** if:
+
+- validation confirmed it live (`analysis.status == "valid"`), or
+- its rule's `confidence` is `high` or `medium` and validation did not prove it dead
+  (`analysis.status` is not `invalid` or `revoked`).
+
+Everything else is **review**: low confidence, and findings with no `confidence` at all (none of
+the current rules leave it unset, so this only guards future custom rules from silently counting
+as actionable). Without `--validate` there is no `analysis` and the status is `none`, so the tier
+comes from confidence alone. The low-confidence rules are the generic ones (`generic-api-key`,
+`generic-password`, `generic-username`) and the asana, beamer and bearer fallbacks.
+
+Findings are deduplicated by `match.fingerprint` (the SHA-256 of the secret), so a secret
+committed in many places is one entry. A secret is actionable if any of its occurrences is.
+
+### Summary fields
+
+Each entry in `<date>_summary.json` has:
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `url` | Repo name (`<path>-<id>`) and GitLab URL |
+| `status` | `pwned`, `review`, `clean` or `error` |
+| `report` | Path of the raw betterleaks report, or `null` |
+| `unique_secrets` | Distinct secrets (fingerprints) found |
+| `actionable`, `review` | How many of those are in each tier |
+| `triage.actionable`, `triage.review` | One object per secret: `rule_id`, `confidence`, `status` (validation status, `none` if not validated), `path`, `line` and `commit` of its first occurrence in its tier, `occurrences`, and `fingerprint` |
+
+The triage entries hold no secret values, only fingerprints and locations.
 
 ## Tests
 
@@ -132,6 +176,37 @@ are skipped if betterleaks isn't installed). They check that a repo can't silenc
 that `full` mode finds secrets in archives, merge-request refs and commit messages, that
 placeholder and low-entropy decoys stay `clean`, and that the fixture baseline below still holds.
 
+### Benchmark
+
+`test_benchmark` commits three labeled corpora to throwaway repos, scans each in `full` mode, and
+prints recall and precision per corpus and per rule (run with `-s` to see them):
+
+```sh
+python3 -m pytest -s -k benchmark
+```
+
+- `test_fixtures/` - positives; every file except the `aws.txt` decoy must be detected.
+- `test_fixtures_hard/` - positives that scanners tend to miss: multi-line JSON, nested YAML,
+  quoted `.env` values, .NET XML `appSettings`, credentials in a URL, a base64-encoded token,
+  a secret committed and then deleted (`deleted_*` files), and a secret only on a non-default
+  branch (`branch_*` files). `HARD_EXPECTED` in the test lists the secret values each file must
+  surface, either as a finding or as a component of one (like an AWS secret key paired with its
+  key ID).
+- `test_fixtures_negative/` - false-positive bait that must produce no finding: lock-file
+  integrity hashes, UUIDs, git SHAs and checksums, minified JS, `data:image/png` URIs, docs
+  placeholders, translated `password` labels, the AWS docs key pair and jwt.io sample token, and
+  Terraform/Helm variable references.
+
+The test fails on any false positive, any missed file or hard-case value, or any positive file
+whose tier differs from expectations (`EXPECTED_REVIEW` lists the positives expected in
+`review`; the rest must be actionable).
+
+To add a case, drop a synthetic (fake but realistically formatted) file into the right corpus.
+For a hard case, add its file and values to `HARD_EXPECTED` (and to `EXPECTED_REVIEW` if only
+low-confidence rules catch it). Then run the benchmark and fix any false positive with the
+narrowest filter in `betterleaks.toml`, never one that drops a positive. Don't add files to
+`test_fixtures/`: its file set is pinned by the baseline test.
+
 ## test_fixtures/
 
 `test_fixtures/` contains synthetic, fake credentials (not real secrets) used to
@@ -141,7 +216,8 @@ sanity-check that a secret-detection regex/rule actually matches a given format
 `tests/test_gitscrapper.py` records which fixtures the pinned rules in `betterleaks.toml` detect.
 betterleaks v2's default rules alone catch 26 of the 34 fixtures; `betterleaks.toml` adds 7 custom
 rules for the rest (agora, alchemy, amazon-mws, asana, azure management certificate, beamer, and a
-generic bearer token rule). 33 of 34 fixtures are detected; `aws.txt` is intentionally left
+generic bearer token rule), plus one for secret-named .NET `appSettings` entries
+(`dotnet-appsetting-secret`) found by the benchmark. 33 of 34 fixtures are detected; `aws.txt` is intentionally left
 undetected because its values contain the literal word "fake" (`ASIIAMFAKE...`) and its key ID
 isn't a valid AWS prefix. If a new fixture is added or a rule's format changes, update both
 `betterleaks.toml` and the baseline in the test.
@@ -150,5 +226,9 @@ The asana, beamer and bearer rules are loose, generic fallbacks for credential s
 fixtures omit the service name, so they carry `confidence = "low"` and an entropy /
 token-efficiency filter to drop readable or repetitive values. A global `filter` in
 `betterleaks.toml` drops only unambiguous placeholders (`YOUR_API_KEY_HERE`, `changeme`,
-`<redacted>`, `${VAR}`, runs of `x` or `0`). There is deliberately no exclusion by the word
-`EXAMPLE` or by test/fixture paths: real secrets turn up there too.
+`<redacted>`, `${VAR}`, runs of `x` or `0`), the AWS docs key pair and jwt.io sample token by
+exact value, and two skips scoped to one default rule each by `finding.rule_id`: letters-only
+`generic-password` values in locale files, and hex digests under hash-named keys (`token_sha`)
+for `generic-api-key`. Those skips live in the global filter because redefining a default rule
+replaces it entirely. There is deliberately no exclusion by the word `EXAMPLE` or by
+test/fixture paths: real secrets turn up there too.
