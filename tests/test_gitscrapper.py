@@ -59,6 +59,42 @@ EXPECTED_DETECTED = {
 # decoy, not a detection gap.
 EXPECTED_MISSED = {"aws.txt"}
 
+# Labeled benchmark corpora. Every file in NEGATIVE_DIR is false-positive bait
+# and must produce no finding. Every file in HARD_DIR must surface the secret
+# values listed in HARD_EXPECTED, as a finding or as a component of one.
+# deleted_* files are committed and then removed; branch_* files only exist on
+# a non-default branch.
+NEGATIVE_DIR = os.path.join(g.SCRIPT_DIR, "test_fixtures_negative")
+HARD_DIR = os.path.join(g.SCRIPT_DIR, "test_fixtures_hard")
+HARD_EXPECTED = {
+    "multiline.json": {"sk_live_KTfg0EpeZ6FzFLd5jpffAVQ7"},
+    "nested.yaml": {"AKIAXUIMYLEMFST2LSXP", "/KLHpxFReOKq5qPtGwlgYefVLFmFrmiovr/CY7Mz"},
+    "quoted.env": {"bzhIfbgNk@GYUgsL"},
+    "web.config": {"PsgQsNhpTL0hZn0Vc96l2tKaVPcDSHkJCBSCxZNR"},
+    "url.txt": {"wL1M0F3F2kzEq8Vr"},
+    "k8s_secret.yaml": {"xoxb-51136943514-948438804521-c9USN1xEDjv0acy1sS1xTZBf"},
+    "deleted_github_token.txt": {"ghp_IoJv3AcUYHL2qOrhvsAjQjkfbsjRw6VCIA7u"},
+    "branch_gitlab_token.txt": {"glpat-lh9RY-xEMWtxa6jxH9zq"},
+}
+# Positive files whose only findings come from low-confidence generic rules,
+# so triage puts them in "review". Every other positive file is "actionable".
+EXPECTED_REVIEW = {
+    "Adrafruit_IO_API_key.txt",
+    "adobe_api_keys.txt",
+    "airtable_apikey.txt",
+    "anypoint_keys.txt",
+    "asana_access_token.txt",
+    "atlassian_oauth2.txt",
+    "auth0_keys.txt",
+    "azure_cosmosdb_credentials.txt",
+    "azure_subscription_key.txt",
+    "beamer_apikey.txt",
+    "bearer_token.txt",
+    "bitfinex_keys.txt",
+    "buildkite_agent_token.txt",
+    "buildkite_api_token.txt",
+}
+
 # Placeholders, prose and low-entropy values that must not be reported.
 DECOY_FILES = {
     "placeholders.env": (
@@ -493,3 +529,97 @@ def test_fixture_detection_baseline(workdir):
         f"newly missed: {sorted(EXPECTED_DETECTED - detected)}, "
         f"newly detected: {sorted(detected - EXPECTED_DETECTED)}"
     )
+
+
+def corpus_files(src):
+    return {
+        os.path.relpath(os.path.join(root, filename), src)
+        for root, _, filenames in os.walk(src)
+        for filename in filenames
+    }
+
+
+def commit_corpus(src, name):
+    """Commits src to repositories/<name>: deleted_* files are removed in a
+    second commit and branch_* files only land on a "feature" branch."""
+    dest = g.repo_path(name)
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns("branch_*"))
+    git(dest, "init", "-q", "-b", "main")
+    git(dest, "add", "-A")
+    git(dest, "commit", "-q", "-m", "corpus")
+    files = corpus_files(src)
+    deleted = sorted(f for f in files if os.path.basename(f).startswith("deleted_"))
+    if deleted:
+        git(dest, "rm", "-q", *deleted)
+        git(dest, "commit", "-q", "-m", "remove secrets")
+    branch_only = sorted(f for f in files if os.path.basename(f).startswith("branch_"))
+    if branch_only:
+        git(dest, "checkout", "-q", "-b", "feature")
+        for relpath in branch_only:
+            shutil.copy(os.path.join(src, relpath), os.path.join(dest, relpath))
+        git(dest, "add", "-A")
+        git(dest, "commit", "-q", "-m", "feature")
+        git(dest, "checkout", "-q", "main")
+
+
+def benchmark_scan(src, name):
+    """Scans src in full mode, unredacted so paths and values stay comparable."""
+    commit_corpus(src, name)
+    command = [arg for arg in g.betterleaks_command(name, "full")
+               if not arg.startswith("--redact")]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode in (0, g.LEAKS_EXIT_CODE), result.stderr
+    return load_findings(name)
+
+
+def finding_values(finding):
+    values = {finding["match"]["value"]}
+    for component_set in finding.get("component_sets") or []:
+        for component in component_set["components"]:
+            values.add(component["match"]["value"])
+    return values
+
+
+@needs_betterleaks
+def test_benchmark(workdir):
+    assert set(corpus_files(HARD_DIR)) == set(HARD_EXPECTED)
+    corpora = {
+        "fixtures": (FIXTURES_DIR, EXPECTED_DETECTED),
+        "hard": (HARD_DIR, set(HARD_EXPECTED)),
+        "negative": (NEGATIVE_DIR, set()),
+    }
+    per_rule = {}
+    false_positives, false_negatives, wrong_tiers = [], [], []
+    for corpus, (src, positives) in corpora.items():
+        findings = benchmark_scan(src, f"bench-{corpus}")
+        by_path = {}
+        for finding in findings:
+            path = finding["location"]["path"]
+            by_path.setdefault(path, []).append(finding)
+            counts = per_rule.setdefault(finding["rule_id"], {"tp": 0, "fp": 0})
+            if path in positives:
+                counts["tp"] += 1
+            else:
+                counts["fp"] += 1
+                false_positives.append((corpus, path, finding["rule_id"], finding["match"]["value"]))
+        detected = positives & set(by_path)
+        false_negatives += [(corpus, path) for path in sorted(positives - detected)]
+        if corpus == "hard":
+            for path, expected in HARD_EXPECTED.items():
+                found = set().union(*(finding_values(f) for f in by_path.get(path, [])))
+                false_negatives += [(corpus, path, value) for value in sorted(expected - found)]
+        flagged = sum(len(by_path[path]) for path in by_path)
+        true_positives = sum(len(by_path[path]) for path in detected)
+        recall = f"{len(detected) / len(positives):.2f}" if positives else "n/a"
+        print(
+            f"\n{corpus}: recall={recall} ({len(detected)}/{len(positives)} files), "
+            f"precision={true_positives / flagged if flagged else 1.0:.2f} "
+            f"({true_positives}/{flagged} findings)"
+        )
+    for rule_id, counts in sorted(per_rule.items()):
+        precision = counts["tp"] / (counts["tp"] + counts["fp"])
+        print(f"  {rule_id:<32} tp={counts['tp']:<3} fp={counts['fp']:<3} precision={precision:.2f}")
+
+    assert false_positives == []
+    assert false_negatives == []
+    assert wrong_tiers == []

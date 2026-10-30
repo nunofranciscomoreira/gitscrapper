@@ -1,0 +1,10 @@
+# Release metadata written by CI. None of these values are credentials.
+release:
+  commit_sha: 11f6ad8ec52a2984abaafd7c3b516503785c2072
+  build_id: 8bc484e0-10f1-4038-adb0-63bc15e27605
+  request_id: "3b6f1c2e-9d4a-4f7b-8c21-5e0a7d9f4b13"
+  artifact_sha256: a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa
+  artifact_md5: fbade9e36a3f36d3d676c1b808451dd7
+  key_id: 4f1e9a2c-7b3d-4e8f-a6c5-0d2b9e7f1a34
+  token_sha: 9c3e5a7b1d2f4068ae1b3c5d7e9f0a2b4c6d8e0f
+  cache_key: sha256-0b8f1d0e3a6c4b2e9f7a5d3c1b0e8f6a4d2c0b9e7f5a3d1c8b6e4f2a0d9c7b5e

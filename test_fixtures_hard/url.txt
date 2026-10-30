@@ -1,0 +1,1 @@
+Mirror the packages from https://deploy:wL1M0F3F2kzEq8Vr@registry.internal.corp/artifactory/api/pypi/simple

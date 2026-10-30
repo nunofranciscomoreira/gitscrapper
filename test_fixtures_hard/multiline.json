@@ -1,0 +1,8 @@
+{
+  "payments": {
+    "provider": "stripe",
+    "secret_key":
+      "sk_live_KTfg0EpeZ6FzFLd5jpffAVQ7",
+    "currency": "eur"
+  }
+}
