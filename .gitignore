@@ -2,3 +2,5 @@ repositories/
 leaks_reports/
 .env
 __pycache__/
+.venv/
+.pytest_cache/
