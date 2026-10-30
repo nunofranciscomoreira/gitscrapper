@@ -1,0 +1,3 @@
+# Central ignore file for gitscrapper, passed with --ignore-file so a scanned
+# repo's own .betterleaksignore is never used. One entry per line: the bare
+# SHA-256 of a secret value, as printed by `betterleaks fingerprint`.
