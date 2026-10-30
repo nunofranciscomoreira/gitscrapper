@@ -1,120 +1,162 @@
 #!/usr/bin/python3
-"""List all Git projects and run gitleaks all
-   Before running 
-        create the "repositories" and "leaks_reports" folders
-        change GIT_ENPOINT 
-        change GIT_PRIVATE_TOKEN
+"""List all GitLab projects and run gitleaks against each of them.
+
+Before running:
+    - create the "repositories" and "leaks_reports" folders
+    - export GIT_ENDPOINT   (e.g. https://gitlab.example.com)
+    - export GIT_PRIVATE_TOKEN
+    - optionally export GITLEAKS_BIN (defaults to "gitleaks" on PATH)
 """
-import subprocess
-import os
-from datetime import date
-from multiprocessing.dummy import Pool as ThreadPool
 import json
+import logging
+import os
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+
 import gitlab
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("gitscrapper")
 
-pwned_commands = []
-clean_commands = []
+GITLEAKS_BIN = os.environ.get("GITLEAKS_BIN", shutil.which("gitleaks") or "gitleaks")
+
 today = date.today()
 today_frmt = today.strftime("%b-%d-%Y")
 
 
-def call_cmd(command_str):
-    """Executes a command on the host machine."""
-    try:
-        subprocess.check_output(command_str, shell=True)
-        if "gitleaks" in command_str:
-            clean_commands.append(command_str)
-    except BaseException:
-        if "gitleaks" in command_str:
-            pwned_commands.append(command_str)
-
-
 def clone(ssh_url_to_repo, name):
-    """Clones repository to the machine."""
-    cmd = f"git clone {ssh_url_to_repo} repositories/{name}"
-    call_cmd(cmd)
+    """Clones a repository to the machine. Raises CalledProcessError on failure."""
+    dest = f"repositories/{name}"
+    subprocess.run(
+        ["git", "clone", ssh_url_to_repo, dest],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
-def gitleak_check(name, http_link):
-    """Executes gitleak on a repository."""
-    cmd = f"./gitleaks detect -s repositories/{name} --report-path leaks_reports/secrets_{name}.json"
-    call_cmd(cmd)
-    append_link(name, http_link)
+def gitleak_check(name):
+    """Runs gitleaks against a cloned repository.
+
+    gitleaks exits 0 when no leaks are found and 1 when leaks are found;
+    any other exit code indicates a real tool error. Returns the exit code
+    so the caller can distinguish these three cases.
+    """
+    report_path = f"leaks_reports/secrets_{name}.json"
+    result = subprocess.run(
+        [
+            GITLEAKS_BIN,
+            "detect",
+            "-s",
+            f"repositories/{name}",
+            "--report-path",
+            report_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode
 
 
 def append_link(name, http_link):
-    """Adds repository link to json report."""
-    web = '{"RepoUrl": "'+  http_link + '\"},'
+    """Adds the repository's web URL to its json report, dropping empty reports."""
+    report_path = f"leaks_reports/secrets_{name}.json"
     try:
-        with open(f"leaks_reports/secrets_{name}.json", "r+") as jsonFile:
-            data_lines = jsonFile.read()
-            if len(data_lines) <= 3:
-                os.remove(f"leaks_reports/{name}.json")
-            else:
-                jsonFile.seek(0,0)
-                a ='[\n '+ web+ '\n' + data_lines[2:]
-                jsonFile.write(a)
-    except:
-        pass
+        with open(report_path, "r", encoding="utf-8") as report_file:
+            findings = json.load(report_file)
+    except FileNotFoundError:
+        return
+    except json.JSONDecodeError:
+        log.warning("Could not parse report for %s, leaving it as-is", name)
+        return
+
+    if not findings:
+        os.remove(report_path)
+        return
+
+    findings.insert(0, {"RepoUrl": http_link})
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        json.dump(findings, report_file, indent=2)
 
 
 def remove_repo(name):
-    """Deletes Repository from the machine."""
-    cmd = f"rm -rf repositories/{name}"
-    call_cmd(cmd)
+    """Deletes a cloned repository from the machine."""
+    shutil.rmtree(f"repositories/{name}", ignore_errors=True)
 
 
-def organize(repos):
-    """Schedules everything."""
-    urls = repos.split("_")
-    name = urls[0].split("/")
-    ssh_url_to_repo = urls[0]
-    repo_name_ssh = name[-1]
-    repo_name_web = urls[1]
-    clone(ssh_url_to_repo, repo_name_ssh)
-    gitleak_check(repo_name_ssh, repo_name_web)
-    remove_repo(repo_name_ssh)
+def organize(project):
+    """Clones, scans and cleans up a single project. Returns (name, status)
+    where status is "clean", "pwned" or "error". Never raises: any failure
+    is logged and reported as "error" so one bad repo can't abort the run
+    or skip cleanup for the others running concurrently.
+    """
+    name = project["name"]
+    ssh_url_to_repo = project["ssh_url"]
+    http_link = project["http_url"]
+
+    try:
+        clone(ssh_url_to_repo, name)
+    except subprocess.CalledProcessError as exc:
+        log.error("Clone failed for %s: %s", name, exc.stderr.strip())
+        remove_repo(name)
+        return name, "error"
+
+    try:
+        returncode = gitleak_check(name)
+        append_link(name, http_link)
+    except Exception:  # pylint: disable=broad-except
+        log.exception("Scan failed for %s", name)
+        returncode = None
+    finally:
+        remove_repo(name)
+
+    if returncode == 0:
+        return name, "clean"
+    if returncode == 1:
+        return name, "pwned"
+    log.error("gitleaks exited %s on %s", returncode, name)
+    return name, "error"
+
+
+def main():
+    git_endpoint = os.environ["GIT_ENDPOINT"]
+    git_private_token = os.environ["GIT_PRIVATE_TOKEN"]
+
+    gl = gitlab.Gitlab(url=git_endpoint, private_token=git_private_token)
+    gl.auth()
+    git_projects = gl.projects.list(get_all=True)  # returns all projects, can take a while
+    projects = [
+        {
+            # project.id is unique instance-wide; the repo's own name is kept
+            # in the prefix only for readability, since two projects in
+            # different namespaces (e.g. teamA/backend, teamB/backend) can
+            # otherwise share the same last path segment and collide on
+            # repositories/<name> and leaks_reports/secrets_<name>.json.
+            "name": f"{project.path}-{project.id}",
+            "ssh_url": project.ssh_url_to_repo,
+            "http_url": project.web_url,
+        }
+        for project in git_projects
+    ]
+
+    pwned, clean, errored = [], [], []
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+        for name, status in pool.map(organize, projects):
+            {"clean": clean, "pwned": pwned, "error": errored}[status].append(name)
+
+    with open(f"leaks_reports/{today_frmt}_pwned_repos.txt", "w", encoding="utf-8") as fp:
+        fp.write("\n".join(pwned) + "\n" if pwned else "")
+    with open(f"leaks_reports/{today_frmt}_clean_repos.txt", "w", encoding="utf-8") as fp:
+        fp.write("\n".join(clean) + "\n" if clean else "")
+
+    log.info(
+        "Scan done! clean=%d pwned=%d error=%d", len(clean), len(pwned), len(errored)
+    )
+    if errored:
+        log.warning("Repos that errored out: %s", ", ".join(errored))
+
 
 if __name__ == "__main__":
-
-    GIT_ENPOINT = "https://" # replace gitlab instance link
-    GIT_PRIVATE_TOKEN = ""  # replace token
-
-    gl = gitlab.Gitlab(url=GIT_ENPOINT, private_token=GIT_PRIVATE_TOKEN)
-    gl.auth()
-    git_projects = gl.projects.list(get_all=True)  # return all projects as a list, warning it will take time
-    projects = []
-    for project in git_projects:
-        concatenated = project.ssh_url_to_repo + "_" + project.web_url
-        projects.append(concatenated)
-
-    pool = ThreadPool(os.cpu_count())  # only use the number of cores
-    organizer = pool.map(organize, projects)
-    pool.close()  # Close the pool
-    pool.join()  # Wait for the work to finish
-    
-    with open(
-        f"leaks_reports/{today_frmt}_pwned_commands.txt", "w", encoding="utf-8"
-    ) as fp:
-        for pwned_command in pwned_commands:
-            fp.write(f"{pwned_command}\n")
-    with open(
-        f"leaks_reports/{today_frmt}_clean_commands.txt", "w", encoding="utf-8"
-    ) as fp:
-        for successful_command in clean_commands:
-            fp.write(f"{successful_command}\n")
-
-    print("Scan Done!")
-
-    reports = os.listdir("leaks_reports/")
-    for report in reports:
-        if ".json" in report:
-            try:
-                fp = open(f"leaks_reports/{report}", "r", encoding="utf-8")
-                file_content = json.load(fp)
-                fp.close()
-                if len(file_content) == 0:
-                    os.remove(f"leaks_reports/{report}")
-            except BaseException:
-                pass
+    main()

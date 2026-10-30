@@ -1,0 +1,4 @@
+repositories/
+leaks_reports/
+.env
+__pycache__/
