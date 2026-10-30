@@ -11,12 +11,12 @@ import gitscrapper as g
 FIXTURES_DIR = os.path.join(g.SCRIPT_DIR, "test_fixtures")
 AWS_KEY = "AKIAZ7EXAMPLE3QWERTY"
 
-needs_gitleaks = pytest.mark.skipif(
-    shutil.which(g.GITLEAKS_BIN) is None, reason="gitleaks is not installed"
+needs_betterleaks = pytest.mark.skipif(
+    shutil.which(g.BETTERLEAKS_BIN) is None, reason="betterleaks is not installed"
 )
 
-# Fixtures gitleaks.toml (default rules + the custom rules we added for the
-# formats the default rules missed) detects. A change in either set means the
+# Fixtures betterleaks.toml (default rules + the custom rules we added for the
+# formats the default rules miss) detects. A change in either set means the
 # rules changed and this baseline should be reviewed.
 EXPECTED_DETECTED = {
     "Adrafruit_IO_API_key.txt",
@@ -53,11 +53,36 @@ EXPECTED_DETECTED = {
     "checkout_secret_key.txt",
     "private_key.pem",
 }
-# aws.txt embeds "fake" in its values (ASIIAMFAKE...), matching the stopword
-# both gitleaks' own generic-api-key allowlist and our aws-credentials-generic
-# rule use to skip obvious placeholders. Treated as an intentional decoy, not
-# a detection gap.
+# aws.txt embeds "fake" in its values (ASIIAMFAKE...) and its key ID isn't a
+# valid AWS prefix, so neither the default aws-access-token rule nor
+# generic-api-key's placeholder filters report it. Treated as an intentional
+# decoy, not a detection gap.
 EXPECTED_MISSED = {"aws.txt"}
+
+# Placeholders, prose and low-entropy values that must not be reported.
+DECOY_FILES = {
+    "placeholders.env": (
+        'API_KEY="YOUR_API_KEY_HERE"\n'
+        "DB_PASSWORD=changeme\n"
+        'GITHUB_TOKEN="<redacted>"\n'
+        "AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX\n"
+        "aws_secret_access_key = " + "x" * 40 + "\n"
+        'client_secret = "' + "0" * 32 + '"\n'
+        "STRIPE_SECRET=${STRIPE_SECRET}\n"
+    ),
+    "prose.md": (
+        "Send the header `Authorization: Bearer your_token_here` with every request.\n"
+        'Set api_key = "please_set_this_in_the_environment" before running.\n'
+        'The secret = "this is not a real secret value"\n'
+    ),
+    "lowentropy.txt": (
+        'token = "' + "a" * 30 + '"\n'
+        'headers = {"Authorization": "Bearer ' + "ab" * 12 + '"}\n'
+        "token=b_" + "a" * 36 + "\n"
+        "asana 1/1111111111111111:" + "0" * 32 + "\n"
+        "asana 1/1111111111111111:" + "ab" * 16 + "\n"
+    ),
+}
 
 
 def git(cwd, *args):
@@ -97,6 +122,14 @@ def private_key():
 def load_report(name):
     with open(g.report_path(name), encoding="utf-8") as fp:
         return json.load(fp)
+
+
+def load_findings(name):
+    return load_report(name)["findings"]
+
+
+def report_json(findings, state="complete"):
+    return json.dumps({"schema_version": "1", "findings": findings, "scan": {"state": state}})
 
 
 def project(name, url):
@@ -158,22 +191,43 @@ def test_parse_args_defaults_to_quick_and_rejects_zero_workers():
         g.parse_args(["--workers", "0"])
 
 
-def test_gitleaks_command_pins_config_and_overrides():
-    command = g.gitleaks_command("repo-1", "quick")
-    assert command[1:3] == ["git", "repositories/repo-1"]
-    assert command[command.index("--config") + 1] == g.GITLEAKS_CONFIG
-    assert command[command.index("--gitleaks-ignore-path") + 1] == g.GITLEAKS_IGNORE_DIR
-    assert "--ignore-gitleaks-allow" in command
+def test_parse_args_validate_from_flag_or_env(monkeypatch):
+    monkeypatch.delenv("GITSCRAPPER_VALIDATE", raising=False)
+    assert g.parse_args([]).validate is False
+    assert g.parse_args(["--validate"]).validate is True
+    monkeypatch.setenv("GITSCRAPPER_VALIDATE", "1")
+    assert g.parse_args([]).validate is True
+
+
+def test_betterleaks_command_pins_config_and_overrides():
+    command = g.betterleaks_command("repo-1", "quick")
+    assert command[1:3] == ["git", "repositories/repo-1/.git"]
+    assert command[command.index("--config") + 1] == g.BETTERLEAKS_CONFIG
+    assert command[command.index("--ignore-file") + 1] == g.BETTERLEAKS_IGNORE_FILE
+    assert "--no-allow-signatures" in command
     assert command[command.index("--exit-code") + 1] == str(g.LEAKS_EXIT_CODE)
     assert f"--redact={g.REDACT_PERCENT}" in command
-    assert "--max-archive-depth" not in command
+    assert command[command.index("--output") + 1] == g.report_path("repo-1")
+    assert "--silent" in command
+    assert command[command.index("--max-archive-depth") + 1] == "0"
     assert "--max-decode-depth" not in command
+    assert not any(arg.startswith("--include") for arg in command)
+    assert "--validate" not in command
+    assert "--status" not in command
 
 
-def test_gitleaks_command_full_mode_opens_archives_and_pins_decode_depth():
-    command = g.gitleaks_command("repo-1", "full")
+def test_betterleaks_command_full_mode_opens_archives_and_pins_decode_depth():
+    command = g.betterleaks_command("repo-1", "full")
     assert command[command.index("--max-archive-depth") + 1] == str(g.FULL_MODE_ARCHIVE_DEPTH)
     assert command[command.index("--max-decode-depth") + 1] == str(g.FULL_MODE_DECODE_DEPTH)
+    assert "--include=merges,commit-messages,tag-messages" in command
+
+
+def test_betterleaks_command_validate_drops_only_dead_secrets():
+    command = g.betterleaks_command("repo-1", "quick", validate=True)
+    assert "--validate" in command
+    statuses = set(command[command.index("--status") + 1].split(","))
+    assert statuses == {"valid", "needs_validation", "unknown", "error", "none"}
 
 
 def fake_clone(ssh_url_to_repo, name):
@@ -185,19 +239,42 @@ def fake_clone(ssh_url_to_repo, name):
     [
         (0, "", "clean"),
         (g.LEAKS_EXIT_CODE, "", "pwned"),
-        (1, "FTL unable to load gitleaks config", "error"),
-        (0, "ERR [git] fatal: bad object", "error"),
+        (1, "FTL unable to load betterleaks config", "error"),
+        (0, "ERR failed to scan Git repository", "error"),
     ],
 )
-def test_organize_classifies_gitleaks_result(monkeypatch, returncode, stderr, status):
+def test_organize_classifies_betterleaks_result(monkeypatch, returncode, stderr, status):
     monkeypatch.setattr(g, "clone", fake_clone)
     monkeypatch.setattr(
         g,
-        "gitleak_check",
-        lambda name, mode: subprocess.CompletedProcess([], returncode, "", stderr),
+        "betterleaks_check",
+        lambda name, mode, validate: subprocess.CompletedProcess([], returncode, "", stderr),
     )
     assert g.organize(project("repo-1", "unused")) == ("repo-1", status)
     assert not os.path.exists(g.repo_path("repo-1"))
+
+
+def test_organize_incomplete_scan_is_error(monkeypatch):
+    def incomplete_scan(name, mode, validate):
+        write_files(".", {g.report_path(name): report_json([], state="incomplete")})
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(g, "clone", fake_clone)
+    monkeypatch.setattr(g, "betterleaks_check", incomplete_scan)
+    assert g.organize(project("repo-1", "unused")) == ("repo-1", "error")
+
+
+def test_organize_passes_validate_through(monkeypatch):
+    calls = []
+
+    def scan(name, mode, validate):
+        calls.append(validate)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(g, "clone", fake_clone)
+    monkeypatch.setattr(g, "betterleaks_check", scan)
+    g.organize(project("repo-1", "unused"), validate=True)
+    assert calls == [True]
 
 
 def test_organize_retries_clone_then_errors(monkeypatch):
@@ -220,19 +297,21 @@ def test_organize_clone_timeout_is_error(monkeypatch):
     assert g.organize(project("repo-1", "unused")) == ("repo-1", "error")
 
 
-def test_organize_gitleaks_timeout_is_error_and_cleans_up(monkeypatch):
-    def slow_scan(name, mode):
-        raise subprocess.TimeoutExpired("gitleaks", 1)
+def test_organize_betterleaks_timeout_is_error_and_cleans_up(monkeypatch):
+    def slow_scan(name, mode, validate):
+        raise subprocess.TimeoutExpired("betterleaks", 1)
 
     monkeypatch.setattr(g, "clone", fake_clone)
-    monkeypatch.setattr(g, "gitleak_check", slow_scan)
+    monkeypatch.setattr(g, "betterleaks_check", slow_scan)
     assert g.organize(project("repo-1", "unused")) == ("repo-1", "error")
     assert not os.path.exists(g.repo_path("repo-1"))
 
 
 def test_organize_refuses_clone_without_git_dir(monkeypatch):
     monkeypatch.setattr(g, "clone", lambda url, name: os.makedirs(g.repo_path(name)))
-    monkeypatch.setattr(g, "gitleak_check", lambda name, mode: pytest.fail("scanned"))
+    monkeypatch.setattr(
+        g, "betterleaks_check", lambda name, mode, validate: pytest.fail("scanned")
+    )
     assert g.organize(project("repo-1", "unused")) == ("repo-1", "error")
 
 
@@ -243,22 +322,43 @@ def test_full_mode_scans_even_if_merge_request_fetch_fails(monkeypatch):
     monkeypatch.setattr(g, "clone", fake_clone)
     monkeypatch.setattr(g, "fetch_merge_request_refs", failing_fetch)
     monkeypatch.setattr(
-        g, "gitleak_check", lambda name, mode: subprocess.CompletedProcess([], 0, "", "")
+        g,
+        "betterleaks_check",
+        lambda name, mode, validate: subprocess.CompletedProcess([], 0, "", ""),
     )
     assert g.organize(project("repo-1", "unused"), mode="full") == ("repo-1", "clean")
 
 
 def test_drop_empty_report():
-    write_files(".", {g.report_path("empty-1"): "[]", g.report_path("full-2"): '[{"a": 1}]'})
+    write_files(
+        ".",
+        {
+            g.report_path("empty-1"): report_json([]),
+            g.report_path("full-2"): report_json([{"rule_id": "x"}]),
+        },
+    )
     g.drop_empty_report("empty-1")
     g.drop_empty_report("full-2")
     assert not os.path.exists(g.report_path("empty-1"))
-    assert load_report("full-2") == [{"a": 1}]
+    assert load_findings("full-2") == [{"rule_id": "x"}]
+
+
+def test_report_complete():
+    write_files(
+        ".",
+        {
+            g.report_path("ok-1"): report_json([]),
+            g.report_path("partial-2"): report_json([], state="incomplete"),
+        },
+    )
+    assert g.report_complete("ok-1") is True
+    assert g.report_complete("partial-2") is False
+    assert g.report_complete("missing-3") is True
 
 
 def test_write_summary():
     projects = [project("a-1", "u"), project("b-2", "u"), project("c-3", "u")]
-    write_files(".", {g.report_path("b-2"): '[{"RuleID": "x"}]'})
+    write_files(".", {g.report_path("b-2"): report_json([{"rule_id": "x"}])})
     g.write_summary(projects, {"a-1": "clean", "b-2": "pwned", "c-3": "error"})
 
     with open(f"{g.LEAKS_REPORTS_DIR}/{g.today_frmt}_summary.json", encoding="utf-8") as fp:
@@ -274,44 +374,47 @@ def test_write_summary():
         assert fp.read() == "c-3\n"
 
 
-# --- integration tests (real git + gitleaks) ---------------------------------
+# --- integration tests (real git + betterleaks) ------------------------------
 
 
-@needs_gitleaks
+def scan_findings(target, *extra):
+    """Scans target directly with the pinned config, bypassing gitscrapper."""
+    scan = subprocess.run(
+        [g.BETTERLEAKS_BIN, "git", target, "-c", g.BETTERLEAKS_CONFIG, "--output", "-",
+         "--no-banner", "-l", "error", *extra],
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(scan.stdout)["findings"]
+
+
+@needs_betterleaks
 def test_repo_cannot_silence_its_own_scan(workdir):
     src = make_repo(
         str(workdir / "src"),
         {
             "k.pem": private_key(),
-            "allowed.txt": f"aws_access_key_id = {AWS_KEY} # gitleaks:allow\n",
-            ".gitleaks.toml": '[extend]\nuseDefault = false\n[[rules]]\nid = "noop"\n'
+            "allowed.txt": f"aws_access_key_id = {AWS_KEY} # betterleaks:allow\n",
+            ".betterleaks.toml": '[extend]\nuseDefault = false\n[[rules]]\nid = "noop"\n'
             'regex = "zzzz_never_matches"\n',
         },
     )
     # Ignore every real finding by fingerprint, as a repo owner could.
-    scan = subprocess.run(
-        [g.GITLEAKS_BIN, "git", src, "-c", g.GITLEAKS_CONFIG, "--ignore-gitleaks-allow",
-         "--report-format", "json", "--report-path", "-", "--no-banner", "-l", "error"],
-        capture_output=True,
-        text=True,
-    )
-    fingerprints = [finding["Fingerprint"] for finding in json.loads(scan.stdout)]
-    assert len(fingerprints) == 3
-    write_files(src, {".gitleaksignore": "\n".join(fingerprints) + "\n"})
+    findings = scan_findings(src, "--no-allow-signatures")
+    assert len(findings) == 2
+    fingerprints = [finding["match"]["fingerprint"] for finding in findings]
+    write_files(src, {".betterleaksignore": "\n".join(fingerprints) + "\n"})
     git(src, "add", "-A")
     git(src, "commit", "-q", "-m", "hide findings")
+    assert scan_findings(src) == []
 
     assert g.organize(project("hostile-1", src)) == ("hostile-1", "pwned")
-    report = load_report("hostile-1")
-    assert {finding["RuleID"] for finding in report} == {
-        "private-key",
-        "aws-access-token",
-        "aws-credentials-generic",
-    }
-    assert AWS_KEY not in json.dumps(report)
+    findings = load_findings("hostile-1")
+    assert {finding["rule_id"] for finding in findings} == {"private-key", "aws-access-token"}
+    assert AWS_KEY not in json.dumps(findings)
 
 
-@needs_gitleaks
+@needs_betterleaks
 def test_full_mode_finds_secrets_inside_archives(workdir):
     archive = workdir / "bundle.zip"
     with zipfile.ZipFile(archive, "w") as zf:
@@ -320,10 +423,10 @@ def test_full_mode_finds_secrets_inside_archives(workdir):
 
     assert g.organize(project("zip-1", src), mode="quick") == ("zip-1", "clean")
     assert g.organize(project("zip-1", src), mode="full") == ("zip-1", "pwned")
-    assert any("!" in finding["File"] for finding in load_report("zip-1"))
+    assert any("!" in finding["location"]["path"] for finding in load_findings("zip-1"))
 
 
-@needs_gitleaks
+@needs_betterleaks
 def test_full_mode_scans_merge_request_refs(workdir):
     src = make_repo(str(workdir / "src"), {"README.md": "hello\n"})
     git(src, "checkout", "-q", "-b", "feature")
@@ -338,22 +441,37 @@ def test_full_mode_scans_merge_request_refs(workdir):
     assert g.organize(project("mr-1", src), mode="full") == ("mr-1", "pwned")
 
 
-@needs_gitleaks
+@needs_betterleaks
+def test_full_mode_scans_commit_messages(workdir):
+    src = make_repo(str(workdir / "src"), {"README.md": "hello\n"})
+    git(src, "commit", "-q", "--allow-empty", "-m", f"rotate key\n\nold: {AWS_KEY}")
+
+    assert g.organize(project("msg-1", src), mode="quick") == ("msg-1", "clean")
+    assert g.organize(project("msg-1", src), mode="full") == ("msg-1", "pwned")
+
+
+@needs_betterleaks
 def test_scan_does_not_escape_into_enclosing_repo():
     # The run directory itself is a repo with a leak; a clone missing its
-    # .git must not cause gitleaks to scan this enclosing history instead.
+    # .git must not cause betterleaks to scan this enclosing history instead.
     git(".", "init", "-q", "-b", "main")
     write_files(".", {"k.pem": private_key()})
     git(".", "add", "k.pem")
     git(".", "commit", "-q", "-m", "leak")
     os.makedirs(g.repo_path("broken-1"))
 
-    result = g.gitleak_check("broken-1", "quick")
-    assert result.returncode != g.LEAKS_EXIT_CODE
-    assert not os.path.exists(g.report_path("broken-1")) or load_report("broken-1") == []
+    result = g.betterleaks_check("broken-1", "quick")
+    assert result.returncode not in (0, g.LEAKS_EXIT_CODE)
+    assert not os.path.exists(g.report_path("broken-1")) or load_findings("broken-1") == []
 
 
-@needs_gitleaks
+@needs_betterleaks
+def test_false_positive_decoys_stay_clean(workdir):
+    src = make_repo(str(workdir / "src"), DECOY_FILES)
+    assert g.organize(project("decoy-1", src)) == ("decoy-1", "clean")
+
+
+@needs_betterleaks
 def test_fixture_detection_baseline(workdir):
     assert set(os.listdir(FIXTURES_DIR)) == EXPECTED_DETECTED | EXPECTED_MISSED
     dest = g.repo_path("fixtures-0")
@@ -362,9 +480,15 @@ def test_fixture_detection_baseline(workdir):
     git(dest, "add", "-A")
     git(dest, "commit", "-q", "-m", "fixtures")
 
-    result = g.gitleak_check("fixtures-0", "quick")
+    # Unredacted: --redact also masks captured values wherever they recur in
+    # the report, including file paths (e.g. "amqp" in amqp_credentials.txt).
+    command = [arg for arg in g.betterleaks_command("fixtures-0", "quick")
+               if not arg.startswith("--redact")]
+    result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == g.LEAKS_EXIT_CODE, result.stderr
-    detected = {os.path.basename(finding["File"]) for finding in load_report("fixtures-0")}
+    detected = {
+        os.path.basename(finding["location"]["path"]) for finding in load_findings("fixtures-0")
+    }
     assert detected == EXPECTED_DETECTED, (
         f"newly missed: {sorted(EXPECTED_DETECTED - detected)}, "
         f"newly detected: {sorted(detected - EXPECTED_DETECTED)}"

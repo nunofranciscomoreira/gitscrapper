@@ -1,15 +1,17 @@
 #!/usr/bin/python3
-"""List all GitLab projects and run gitleaks against each of them.
+"""List all GitLab projects and run betterleaks against each of them.
 
 Before running:
     - export GIT_ENDPOINT   (e.g. https://gitlab.example.com)
     - export GIT_PRIVATE_TOKEN
-    - optionally export GITLEAKS_BIN (defaults to "gitleaks" on PATH)
-    - optionally export GITSCRAPPER_WORKERS, GIT_CLONE_TIMEOUT_S, GITLEAKS_TIMEOUT_S,
-      GITSCRAPPER_GITLEAKS_CONFIG, GITSCRAPPER_GITLEAKS_IGNORE_DIR
+    - optionally export BETTERLEAKS_BIN (defaults to "betterleaks" on PATH)
+    - optionally export GITSCRAPPER_WORKERS, GIT_CLONE_TIMEOUT_S, BETTERLEAKS_TIMEOUT_S,
+      GITSCRAPPER_BETTERLEAKS_CONFIG, GITSCRAPPER_BETTERLEAKS_IGNORE_FILE,
+      GITSCRAPPER_VALIDATE
 
 The "repositories" and "leaks_reports" folders are created automatically.
-Run with --help for CLI options (--mode, --workers, --dry-run, --skip-archived).
+Run with --help for CLI options (--mode, --workers, --dry-run, --skip-archived,
+--validate).
 """
 import argparse
 import functools
@@ -30,14 +32,18 @@ log = logging.getLogger("gitscrapper")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-GITLEAKS_BIN = os.environ.get("GITLEAKS_BIN", shutil.which("gitleaks") or "gitleaks")
-# Always passed with --config, so a repo's own .gitleaks.toml is never used.
-GITLEAKS_CONFIG = os.environ.get(
-    "GITSCRAPPER_GITLEAKS_CONFIG", os.path.join(SCRIPT_DIR, "gitleaks.toml")
+BETTERLEAKS_BIN = os.environ.get(
+    "BETTERLEAKS_BIN", shutil.which("betterleaks") or "betterleaks"
 )
-# Directory holding the central .gitleaksignore (if any). Pinned so gitleaks
-# doesn't pick one up from whatever directory the script is run from.
-GITLEAKS_IGNORE_DIR = os.environ.get("GITSCRAPPER_GITLEAKS_IGNORE_DIR", SCRIPT_DIR)
+# Always passed with --config, so a repo's own .betterleaks.toml is never used.
+BETTERLEAKS_CONFIG = os.environ.get(
+    "GITSCRAPPER_BETTERLEAKS_CONFIG", os.path.join(SCRIPT_DIR, "betterleaks.toml")
+)
+# Central ignore file. Always passed with --ignore-file: without it betterleaks
+# reads <scanned repo>/.betterleaksignore, which the repo itself controls.
+BETTERLEAKS_IGNORE_FILE = os.environ.get(
+    "GITSCRAPPER_BETTERLEAKS_IGNORE_FILE", os.path.join(SCRIPT_DIR, ".betterleaksignore")
+)
 
 
 def positive_int(value):
@@ -64,7 +70,7 @@ def positive_int_env(name, default):
 
 
 GIT_CLONE_TIMEOUT_S = positive_int_env("GIT_CLONE_TIMEOUT_S", 300)
-GITLEAKS_TIMEOUT_S = positive_int_env("GITLEAKS_TIMEOUT_S", 600)
+BETTERLEAKS_TIMEOUT_S = positive_int_env("BETTERLEAKS_TIMEOUT_S", 600)
 
 # This workload is I/O-bound (network clone dominates wall time, not CPU), so
 # default to more workers than os.cpu_count() would give. Still capped so we
@@ -75,27 +81,36 @@ CLONE_RETRIES = 1  # extra attempts after the first, on transient failures only
 CLONE_RETRY_BACKOFF_S = 3
 
 # "quick" scans every branch and tag of a normal clone. "full" also fetches
-# GitLab merge-request refs, opens archives (zip, tar, ...), and recursively
-# decodes percent/hex/base64-encoded text in the repo.
+# GitLab merge-request refs, opens archives (zip, tar, ...), recursively
+# decodes percent/hex/base64-encoded text, and scans merge-commit diffs and
+# commit/tag messages.
 SCAN_MODES = ("quick", "full")
+# betterleaks' git default is 8, so quick mode has to turn archives off explicitly.
+QUICK_MODE_ARCHIVE_DEPTH = 0
 FULL_MODE_ARCHIVE_DEPTH = 2
-# gitleaks' own --help default for this flag has disagreed with its README
-# across versions (seen 0 and 5 on different builds), so quick mode leaves it
-# unset (whatever the installed gitleaks defaults to) and only full mode
-# pins an explicit value, for a reproducible "maximum effort" scan.
 FULL_MODE_DECODE_DEPTH = 5
+FULL_MODE_INCLUDE = "merges,commit-messages,tag-messages"
 MERGE_REQUEST_REFSPEC = "+refs/merge-requests/*/head:refs/remotes/origin/merge-requests/*"
 
-# gitleaks exits 1 on fatal errors (e.g. a broken config) as well as on leaks
-# by default, so leaks get their own exit code to keep the two apart.
+# With --validate, keep every status except those proving the secret is dead:
+# rules without a validator ("none") and failed checks must not become misses.
+VALIDATE_KEEP_STATUSES = "valid,needs_validation,unknown,error,none"
+
+# betterleaks exits 1 on fatal errors (e.g. a broken config) as well as on
+# leaks by default, so leaks get their own exit code to keep the two apart.
 LEAKS_EXIT_CODE = 2
 # Percentage of each secret to mask in reports: enough to keep the real
 # credential out of leaks_reports/, while leaving a prefix to triage with.
 REDACT_PERCENT = 80
 
-# gitleaks reads <repo root>/.gitleaksignore even when --gitleaks-ignore-path
-# points elsewhere, so it is deleted from the clone before scanning.
-REPO_SCAN_OVERRIDES = (".gitleaksignore",)
+# Deleted from each clone before scanning, so a repo can't hide its own
+# findings even if a future flag or default starts reading them.
+REPO_SCAN_OVERRIDES = (
+    ".betterleaksignore",
+    ".gitleaksignore",
+    ".betterleaks.toml",
+    ".gitleaks.toml",
+)
 
 REPOSITORIES_DIR = "repositories"
 LEAKS_REPORTS_DIR = "leaks_reports"
@@ -191,7 +206,7 @@ def fetch_merge_request_refs(name):
 
 
 def remove_scan_overrides(name):
-    """Deletes files a repo could use to hide its own findings from gitleaks."""
+    """Deletes files a repo could use to hide its own findings from betterleaks."""
     for filename in REPO_SCAN_OVERRIDES:
         path = os.path.join(repo_path(name), filename)
         if os.path.isdir(path) and not os.path.islink(path):
@@ -200,25 +215,27 @@ def remove_scan_overrides(name):
             os.remove(path)
 
 
-def gitleaks_command(name, mode):
+def betterleaks_command(name, mode, validate=False):
     command = [
-        GITLEAKS_BIN,
+        BETTERLEAKS_BIN,
         "git",
-        repo_path(name),
+        # The .git dir, not the worktree: betterleaks resolves a worktree path
+        # to its enclosing repository and ignores GIT_CEILING_DIRECTORIES, so a
+        # clone missing its .git would get whatever repo encloses it scanned.
+        os.path.join(repo_path(name), ".git"),
         "--config",
-        GITLEAKS_CONFIG,
-        "--gitleaks-ignore-path",
-        GITLEAKS_IGNORE_DIR,
-        "--ignore-gitleaks-allow",
+        BETTERLEAKS_CONFIG,
+        "--ignore-file",
+        BETTERLEAKS_IGNORE_FILE,
+        "--no-allow-signatures",
         "--exit-code",
         str(LEAKS_EXIT_CODE),
         "--platform",
         "gitlab",
         f"--redact={REDACT_PERCENT}",
-        "--report-format",
-        "json",
-        "--report-path",
+        "--output",
         report_path(name),
+        "--silent",
         "--no-banner",
         "--log-level",
         "error",
@@ -226,26 +243,40 @@ def gitleaks_command(name, mode):
     if mode == "full":
         command += ["--max-archive-depth", str(FULL_MODE_ARCHIVE_DEPTH)]
         command += ["--max-decode-depth", str(FULL_MODE_DECODE_DEPTH)]
+        command += [f"--include={FULL_MODE_INCLUDE}"]
+    else:
+        command += ["--max-archive-depth", str(QUICK_MODE_ARCHIVE_DEPTH)]
+    if validate:
+        command += ["--validate", "--status", VALIDATE_KEEP_STATUSES]
     return command
 
 
-def gitleak_check(name, mode):
-    """Runs gitleaks against a cloned repository and returns the CompletedProcess.
+def betterleaks_check(name, mode, validate=False):
+    """Runs betterleaks against a cloned repository and returns the CompletedProcess.
 
     Exit code 0 means no leaks, LEAKS_EXIT_CODE means leaks were found, and
     anything else is a tool error. Raises subprocess.TimeoutExpired if the
-    scan exceeds GITLEAKS_TIMEOUT_S.
+    scan exceeds BETTERLEAKS_TIMEOUT_S.
     """
-    # Without a ceiling, a clone missing its .git would make git walk up and
-    # scan whichever repository encloses repositories/ instead.
-    env = {**os.environ, "GIT_CEILING_DIRECTORIES": os.path.abspath(REPOSITORIES_DIR)}
     return subprocess.run(
-        gitleaks_command(name, mode),
+        betterleaks_command(name, mode, validate),
         capture_output=True,
         text=True,
-        timeout=GITLEAKS_TIMEOUT_S,
-        env=env,
+        timeout=BETTERLEAKS_TIMEOUT_S,
     )
+
+
+def report_complete(name):
+    """False if betterleaks marked the scan incomplete (e.g. corrupt objects or
+    unreadable refs), since a partial scan can't vouch for a clean repo."""
+    try:
+        with open(report_path(name), "r", encoding="utf-8") as report_file:
+            report = json.load(report_file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return True
+    if not isinstance(report, dict):
+        return True
+    return (report.get("scan") or {}).get("state") != "incomplete"
 
 
 def drop_empty_report(name):
@@ -253,13 +284,13 @@ def drop_empty_report(name):
     path = report_path(name)
     try:
         with open(path, "r", encoding="utf-8") as report_file:
-            findings = json.load(report_file)
+            report = json.load(report_file)
     except FileNotFoundError:
         return
     except json.JSONDecodeError:
         log.warning("Could not parse report for %s, leaving it as-is", name)
         return
-    if not findings:
+    if isinstance(report, dict) and not report.get("findings"):
         os.remove(path)
 
 
@@ -276,7 +307,7 @@ def _last_line(text):
     return lines[-1] if lines else ""
 
 
-def organize(project, mode="quick"):
+def organize(project, mode="quick", validate=False):
     """Clones, scans and cleans up a single project. Returns (name, status)
     where status is "clean", "pwned" or "error". Never raises: any failure
     is logged and reported as "error" so one bad repo can't abort the run
@@ -297,6 +328,7 @@ def organize(project, mode="quick"):
         return name, "error"
 
     result = None
+    complete = True
     try:
         if not os.path.isdir(os.path.join(repo_path(name), ".git")):
             log.error("Clone of %s has no .git directory, not scanning it", name)
@@ -311,10 +343,11 @@ def organize(project, mode="quick"):
                     name,
                     _last_line(getattr(exc, "stderr", "")) or type(exc).__name__,
                 )
-        result = gitleak_check(name, mode)
+        result = betterleaks_check(name, mode, validate)
+        complete = report_complete(name)
         drop_empty_report(name)
     except subprocess.TimeoutExpired:
-        log.error("gitleaks timed out for %s after %ds", name, GITLEAKS_TIMEOUT_S)
+        log.error("betterleaks timed out for %s after %ds", name, BETTERLEAKS_TIMEOUT_S)
     except Exception:  # pylint: disable=broad-except
         log.exception("Scan failed for %s", name)
     finally:
@@ -324,12 +357,15 @@ def organize(project, mode="quick"):
         return name, "error"
     if result.returncode == LEAKS_EXIT_CODE:
         return name, "pwned"
+    if not complete:
+        log.error("betterleaks scan of %s was incomplete: %s", name, _last_line(result.stderr))
+        return name, "error"
     if result.returncode == 0 and not result.stderr.strip():
         return name, "clean"
-    # Exit 0 with error output means gitleaks swallowed a failure (e.g. git
-    # log erroring out), so the "no leaks" result can't be trusted.
+    # Exit 0 with error output means betterleaks swallowed a failure (e.g. git
+    # erroring out), so the "no leaks" result can't be trusted.
     log.error(
-        "gitleaks exited %s on %s: %s", result.returncode, name, _last_line(result.stderr)
+        "betterleaks exited %s on %s: %s", result.returncode, name, _last_line(result.stderr)
     )
     return name, "error"
 
@@ -384,28 +420,38 @@ def parse_args(argv=None):
         action="store_true",
         help="don't scan archived projects",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        default=os.environ.get("GITSCRAPPER_VALIDATE", "").lower() in ("1", "true", "yes"),
+        help="check findings against provider APIs and drop only those confirmed "
+        "invalid or revoked; sends each candidate secret to its provider "
+        "(also set by GITSCRAPPER_VALIDATE=1)",
+    )
     return parser.parse_args(argv)
 
 
 def check_scan_setup():
-    """Exits with a clear error if gitleaks or its pinned config/ignore dir is missing."""
-    if not shutil.which(GITLEAKS_BIN):
+    """Exits with a clear error if betterleaks or its pinned config/ignore file is missing."""
+    if not shutil.which(BETTERLEAKS_BIN):
         log.error(
-            "Could not find gitleaks binary %r. Install gitleaks, put it on PATH, "
-            "or set GITLEAKS_BIN to its full path.",
-            GITLEAKS_BIN,
+            "Could not find betterleaks binary %r. Install betterleaks v2, put it on PATH, "
+            "or set BETTERLEAKS_BIN to its full path.",
+            BETTERLEAKS_BIN,
         )
         sys.exit(1)
-    if not os.path.isfile(GITLEAKS_CONFIG):
+    if not os.path.isfile(BETTERLEAKS_CONFIG):
         log.error(
-            "gitleaks config %r not found. Keep gitleaks.toml next to this script, "
-            "or set GITSCRAPPER_GITLEAKS_CONFIG.",
-            GITLEAKS_CONFIG,
+            "betterleaks config %r not found. Keep betterleaks.toml next to this script, "
+            "or set GITSCRAPPER_BETTERLEAKS_CONFIG.",
+            BETTERLEAKS_CONFIG,
         )
         sys.exit(1)
-    if not os.path.isdir(GITLEAKS_IGNORE_DIR):
+    if not os.path.isfile(BETTERLEAKS_IGNORE_FILE):
         log.error(
-            "GITSCRAPPER_GITLEAKS_IGNORE_DIR %r is not a directory", GITLEAKS_IGNORE_DIR
+            "betterleaks ignore file %r not found. Keep .betterleaksignore next to this "
+            "script, or set GITSCRAPPER_BETTERLEAKS_IGNORE_FILE.",
+            BETTERLEAKS_IGNORE_FILE,
         )
         sys.exit(1)
 
@@ -454,7 +500,12 @@ def main():
 
     projects = build_projects(git_projects)
     total = len(projects)
-    log.info("Found %d project(s) to scan in %s mode", total, args.mode)
+    log.info(
+        "Found %d project(s) to scan in %s mode%s",
+        total,
+        args.mode,
+        " with validation" if args.validate else "",
+    )
 
     if args.dry_run:
         for project in projects:
@@ -465,7 +516,7 @@ def main():
     statuses = {}
     counts = {"clean": 0, "pwned": 0, "error": 0}
     progress_every = max(1, total // 20)  # ~5% increments
-    scan = functools.partial(organize, mode=args.mode)
+    scan = functools.partial(organize, mode=args.mode, validate=args.validate)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for completed, (name, status) in enumerate(pool.map(scan, projects), start=1):
             statuses[name] = status
