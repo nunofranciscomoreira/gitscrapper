@@ -103,6 +103,12 @@ LEAKS_EXIT_CODE = 2
 # credential out of leaks_reports/, while leaving a prefix to triage with.
 REDACT_PERCENT = 80
 
+# Triage: a finding is actionable if a provider confirmed it live, or if its
+# rule is confident and validation didn't prove it dead. Everything else,
+# including findings with no confidence set, is left for manual review.
+ACTIONABLE_CONFIDENCE = ("high", "medium")
+DEAD_STATUSES = ("invalid", "revoked")
+
 # Deleted from each clone before scanning, so a repo can't hide its own
 # findings even if a future flag or default starts reading them.
 REPO_SCAN_OVERRIDES = (
@@ -294,6 +300,61 @@ def drop_empty_report(name):
         os.remove(path)
 
 
+def finding_status(finding):
+    """The validation status of a finding; "none" when it wasn't validated."""
+    return (finding.get("analysis") or {}).get("status") or "none"
+
+
+def finding_tier(finding):
+    """Returns "actionable" or "review" for one betterleaks finding."""
+    status = finding_status(finding)
+    if status == "valid":
+        return "actionable"
+    if finding.get("confidence") in ACTIONABLE_CONFIDENCE and status not in DEAD_STATUSES:
+        return "actionable"
+    return "review"
+
+
+def triage_report(name):
+    """Reads a repo's report and returns {"actionable": [...], "review": [...]},
+    one entry per unique secret (match.fingerprint). A secret is actionable if
+    any of its occurrences is. Values in the report are already redacted."""
+    triage = {"actionable": [], "review": []}
+    try:
+        with open(report_path(name), "r", encoding="utf-8") as report_file:
+            report = json.load(report_file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return triage
+    if not isinstance(report, dict):
+        return triage
+
+    entries = {}
+    for finding in report.get("findings") or []:
+        match = finding.get("match") or {}
+        key = match.get("fingerprint") or (finding.get("rule_id"), match.get("value"))
+        tier = finding_tier(finding)
+        entry = entries.get(key)
+        if entry is not None:
+            entry["occurrences"] += 1
+            if not (tier == "actionable" and entry["tier"] == "review"):
+                continue
+        location = finding.get("location") or {}
+        entries[key] = {
+            "tier": tier,
+            "rule_id": finding.get("rule_id"),
+            "confidence": finding.get("confidence"),
+            "status": finding_status(finding),
+            "path": location.get("path"),
+            "line": location.get("start_line"),
+            "commit": (finding.get("attributes") or {}).get("git.sha"),
+            "occurrences": entry["occurrences"] if entry else 1,
+            "fingerprint": match.get("fingerprint"),
+        }
+    for entry in entries.values():
+        triage[entry.pop("tier")].append(entry)
+    return triage
+
+
 def remove_repo(name):
     """Deletes a cloned repository from the machine, logging (not raising) on failure."""
     path = repo_path(name)
@@ -309,7 +370,8 @@ def _last_line(text):
 
 def organize(project, mode="quick", validate=False):
     """Clones, scans and cleans up a single project. Returns (name, status)
-    where status is "clean", "pwned" or "error". Never raises: any failure
+    where status is "clean", "review" (findings, none actionable), "pwned"
+    (actionable findings) or "error". Never raises: any failure
     is logged and reported as "error" so one bad repo can't abort the run
     or skip cleanup for the others running concurrently.
     """
@@ -329,6 +391,7 @@ def organize(project, mode="quick", validate=False):
 
     result = None
     complete = True
+    triage = None
     try:
         if not os.path.isdir(os.path.join(repo_path(name), ".git")):
             log.error("Clone of %s has no .git directory, not scanning it", name)
@@ -346,6 +409,7 @@ def organize(project, mode="quick", validate=False):
         result = betterleaks_check(name, mode, validate)
         complete = report_complete(name)
         drop_empty_report(name)
+        triage = triage_report(name)
     except subprocess.TimeoutExpired:
         log.error("betterleaks timed out for %s after %ds", name, BETTERLEAKS_TIMEOUT_S)
     except Exception:  # pylint: disable=broad-except
@@ -355,8 +419,13 @@ def organize(project, mode="quick", validate=False):
 
     if result is None:
         return name, "error"
-    if result.returncode == LEAKS_EXIT_CODE:
+    review_only = bool(triage and triage["review"] and not triage["actionable"])
+    # An unreadable report still counts as pwned, and an incomplete scan with
+    # only review-tier findings is an error: it may have missed actionable ones.
+    if result.returncode == LEAKS_EXIT_CODE and not review_only:
         return name, "pwned"
+    if result.returncode == LEAKS_EXIT_CODE and complete:
+        return name, "review"
     if not complete:
         log.error("betterleaks scan of %s was incomplete: %s", name, _last_line(result.stderr))
         return name, "error"
@@ -458,8 +527,8 @@ def check_scan_setup():
 
 def write_summary(projects, statuses):
     """Writes the per-bucket name lists and a JSON index tying each repo to
-    its URL, status and report file."""
-    for label in ("pwned", "clean", "error"):
+    its URL, status, report file and deduplicated, triaged findings."""
+    for label in ("pwned", "review", "clean", "error"):
         names = [p["name"] for p in projects if statuses.get(p["name"]) == label]
         path = f"{LEAKS_REPORTS_DIR}/{today_frmt}_{label}_repos.txt"
         with open(path, "w", encoding="utf-8") as fp:
@@ -469,12 +538,17 @@ def write_summary(projects, statuses):
     for project in projects:
         name = project["name"]
         path = report_path(name)
+        triage = triage_report(name)
         summary.append(
             {
                 "name": name,
                 "url": project["http_url"],
                 "status": statuses.get(name, "error"),
                 "report": path if os.path.exists(path) else None,
+                "unique_secrets": len(triage["actionable"]) + len(triage["review"]),
+                "actionable": len(triage["actionable"]),
+                "review": len(triage["review"]),
+                "triage": triage,
             }
         )
     with open(f"{LEAKS_REPORTS_DIR}/{today_frmt}_summary.json", "w", encoding="utf-8") as fp:
@@ -514,7 +588,7 @@ def main():
 
     start = time.monotonic()
     statuses = {}
-    counts = {"clean": 0, "pwned": 0, "error": 0}
+    counts = {"clean": 0, "review": 0, "pwned": 0, "error": 0}
     progress_every = max(1, total // 20)  # ~5% increments
     scan = functools.partial(organize, mode=args.mode, validate=args.validate)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -523,10 +597,11 @@ def main():
             counts[status] += 1
             if completed % progress_every == 0 or completed == total:
                 log.info(
-                    "Progress: %d/%d done (clean=%d pwned=%d error=%d)",
+                    "Progress: %d/%d done (clean=%d review=%d pwned=%d error=%d)",
                     completed,
                     total,
                     counts["clean"],
+                    counts["review"],
                     counts["pwned"],
                     counts["error"],
                 )
@@ -535,9 +610,10 @@ def main():
     write_summary(projects, statuses)
 
     log.info(
-        "Scan done in %.0fs! clean=%d pwned=%d error=%d",
+        "Scan done in %.0fs! clean=%d review=%d pwned=%d error=%d",
         elapsed,
         counts["clean"],
+        counts["review"],
         counts["pwned"],
         counts["error"],
     )

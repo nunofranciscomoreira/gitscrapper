@@ -392,10 +392,108 @@ def test_report_complete():
     assert g.report_complete("missing-3") is True
 
 
+def fake_finding(fingerprint="fp1", confidence="high", status=None, path="k.pem", sha="c1"):
+    result = {
+        "rule_id": "some-rule",
+        "confidence": confidence,
+        "match": {"value": "AKIA****", "fingerprint": fingerprint},
+        "location": {"path": path, "start_line": 3},
+        "attributes": {"git.sha": sha},
+    }
+    if confidence is None:
+        del result["confidence"]
+    if status is not None:
+        result["analysis"] = {"status": status}
+    return result
+
+
+@pytest.mark.parametrize(
+    "confidence, status, tier",
+    [
+        ("high", None, "actionable"),
+        ("medium", None, "actionable"),
+        ("low", None, "review"),
+        (None, None, "review"),
+        ("low", "valid", "actionable"),
+        (None, "valid", "actionable"),
+        ("high", "unknown", "actionable"),
+        ("medium", "error", "actionable"),
+        ("high", "invalid", "review"),
+        ("medium", "revoked", "review"),
+        ("low", "needs_validation", "review"),
+    ],
+)
+def test_finding_tier(confidence, status, tier):
+    assert g.finding_tier(fake_finding(confidence=confidence, status=status)) == tier
+
+
+def test_triage_report_dedups_by_fingerprint():
+    findings = [fake_finding(sha=f"c{i}", path=f"f{i}.txt") for i in range(3)]
+    findings += [fake_finding("fp2", confidence="low"), fake_finding("fp2", sha="c9")]
+    findings.append(fake_finding("fp3", confidence="low"))
+    write_files(".", {g.report_path("r-1"): report_json(findings)})
+
+    triage = g.triage_report("r-1")
+    assert triage["actionable"] == [
+        {
+            "rule_id": "some-rule",
+            "confidence": "high",
+            "status": "none",
+            "path": "f0.txt",
+            "line": 3,
+            "commit": "c0",
+            "occurrences": 3,
+            "fingerprint": "fp1",
+        },
+        {
+            "rule_id": "some-rule",
+            "confidence": "high",
+            "status": "none",
+            "path": "k.pem",
+            "line": 3,
+            "commit": "c9",
+            "occurrences": 2,
+            "fingerprint": "fp2",
+        },
+    ]
+    assert [entry["fingerprint"] for entry in triage["review"]] == ["fp3"]
+    assert g.triage_report("missing-2") == {"actionable": [], "review": []}
+
+
+def scan_writing(findings, returncode=g.LEAKS_EXIT_CODE, state="complete"):
+    def scan(name, mode, validate):
+        write_files(".", {g.report_path(name): report_json(findings, state=state)})
+        return subprocess.CompletedProcess([], returncode, "", "")
+
+    return scan
+
+
+@pytest.mark.parametrize(
+    "findings, state, status",
+    [
+        ([fake_finding(confidence="low")], "complete", "review"),
+        ([fake_finding(confidence="low"), fake_finding("fp2")], "complete", "pwned"),
+        ([fake_finding(confidence="low", status="valid")], "complete", "pwned"),
+        ([fake_finding(confidence="low")], "incomplete", "error"),
+        ([fake_finding()], "incomplete", "pwned"),
+    ],
+)
+def test_organize_tiers_findings(monkeypatch, findings, state, status):
+    monkeypatch.setattr(g, "clone", fake_clone)
+    monkeypatch.setattr(g, "betterleaks_check", scan_writing(findings, state=state))
+    assert g.organize(project("repo-1", "unused")) == ("repo-1", status)
+
+
 def test_write_summary():
-    projects = [project("a-1", "u"), project("b-2", "u"), project("c-3", "u")]
-    write_files(".", {g.report_path("b-2"): report_json([{"rule_id": "x"}])})
-    g.write_summary(projects, {"a-1": "clean", "b-2": "pwned", "c-3": "error"})
+    projects = [project(name, "u") for name in ("a-1", "b-2", "c-3", "d-4")]
+    write_files(
+        ".",
+        {
+            g.report_path("b-2"): report_json([fake_finding(), fake_finding(sha="c2")]),
+            g.report_path("d-4"): report_json([fake_finding(confidence="low")]),
+        },
+    )
+    g.write_summary(projects, {"a-1": "clean", "b-2": "pwned", "c-3": "error", "d-4": "review"})
 
     with open(f"{g.LEAKS_REPORTS_DIR}/{g.today_frmt}_summary.json", encoding="utf-8") as fp:
         summary = {entry["name"]: entry for entry in json.load(fp)}
@@ -404,10 +502,19 @@ def test_write_summary():
         "url": "https://gitlab.example.com/b-2",
         "status": "pwned",
         "report": g.report_path("b-2"),
+        "unique_secrets": 1,
+        "actionable": 1,
+        "review": 0,
+        "triage": g.triage_report("b-2"),
     }
+    assert summary["b-2"]["triage"]["actionable"][0]["occurrences"] == 2
+    assert (summary["d-4"]["actionable"], summary["d-4"]["review"]) == (0, 1)
     assert summary["a-1"]["report"] is None
-    with open(f"{g.LEAKS_REPORTS_DIR}/{g.today_frmt}_error_repos.txt", encoding="utf-8") as fp:
-        assert fp.read() == "c-3\n"
+    assert summary["a-1"]["triage"] == {"actionable": [], "review": []}
+    for label, expected in (("error", "c-3\n"), ("review", "d-4\n"), ("pwned", "b-2\n")):
+        path = f"{g.LEAKS_REPORTS_DIR}/{g.today_frmt}_{label}_repos.txt"
+        with open(path, encoding="utf-8") as fp:
+            assert fp.read() == expected
 
 
 # --- integration tests (real git + betterleaks) ------------------------------
@@ -608,6 +715,12 @@ def test_benchmark(workdir):
             for path, expected in HARD_EXPECTED.items():
                 found = set().union(*(finding_values(f) for f in by_path.get(path, [])))
                 false_negatives += [(corpus, path, value) for value in sorted(expected - found)]
+        for path in sorted(detected):
+            tiers = {g.finding_tier(finding) for finding in by_path[path]}
+            tier = "actionable" if "actionable" in tiers else "review"
+            expected_tier = "review" if path in EXPECTED_REVIEW else "actionable"
+            if tier != expected_tier:
+                wrong_tiers.append((corpus, path, tier))
         flagged = sum(len(by_path[path]) for path in by_path)
         true_positives = sum(len(by_path[path]) for path in detected)
         recall = f"{len(detected) / len(positives):.2f}" if positives else "n/a"
