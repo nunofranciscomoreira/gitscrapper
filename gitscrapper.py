@@ -75,9 +75,15 @@ CLONE_RETRIES = 1  # extra attempts after the first, on transient failures only
 CLONE_RETRY_BACKOFF_S = 3
 
 # "quick" scans every branch and tag of a normal clone. "full" also fetches
-# GitLab merge-request refs and opens archives (zip, tar, ...) in the repo.
+# GitLab merge-request refs, opens archives (zip, tar, ...), and recursively
+# decodes percent/hex/base64-encoded text in the repo.
 SCAN_MODES = ("quick", "full")
 FULL_MODE_ARCHIVE_DEPTH = 2
+# gitleaks' own --help default for this flag has disagreed with its README
+# across versions (seen 0 and 5 on different builds), so quick mode leaves it
+# unset (whatever the installed gitleaks defaults to) and only full mode
+# pins an explicit value, for a reproducible "maximum effort" scan.
+FULL_MODE_DECODE_DEPTH = 5
 MERGE_REQUEST_REFSPEC = "+refs/merge-requests/*/head:refs/remotes/origin/merge-requests/*"
 
 # gitleaks exits 1 on fatal errors (e.g. a broken config) as well as on leaks
@@ -219,6 +225,7 @@ def gitleaks_command(name, mode):
     ]
     if mode == "full":
         command += ["--max-archive-depth", str(FULL_MODE_ARCHIVE_DEPTH)]
+        command += ["--max-decode-depth", str(FULL_MODE_DECODE_DEPTH)]
     return command
 
 

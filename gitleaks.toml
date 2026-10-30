@@ -50,6 +50,10 @@ id = "aws-credentials-generic"
 description = "aws_access_key_id/aws_secret_access_key assignment, including non-standard prefixes the default aws-access-token rule misses"
 regex = '''(?i)aws_(?:access_key_id|secret_access_key)\s*=\s*['"]?[A-Za-z0-9/+]{16,64}['"]?'''
 keywords = ["aws_access_key_id", "aws_secret_access_key"]
+# Same anti-false-positive logic gitleaks' own generic-api-key rule uses:
+# a value containing "fake" is an obvious placeholder, not a real credential.
+[[rules.allowlists]]
+stopwords = ["fake"]
 
 [[rules]]
 id = "azure-management-certificate"

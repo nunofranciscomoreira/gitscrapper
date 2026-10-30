@@ -35,7 +35,6 @@ EXPECTED_DETECTED = {
     "asana_access_token.txt",
     "atlassian_oauth2.txt",
     "auth0_keys.txt",
-    "aws.txt",
     "aws_iam.txt",
     "aws_ses_keys.txt",
     "azure_active_directory_api_keys.txt",
@@ -54,7 +53,11 @@ EXPECTED_DETECTED = {
     "checkout_secret_key.txt",
     "private_key.pem",
 }
-EXPECTED_MISSED = set()
+# aws.txt embeds "fake" in its values (ASIIAMFAKE...), matching the stopword
+# both gitleaks' own generic-api-key allowlist and our aws-credentials-generic
+# rule use to skip obvious placeholders. Treated as an intentional decoy, not
+# a detection gap.
+EXPECTED_MISSED = {"aws.txt"}
 
 
 def git(cwd, *args):
@@ -164,11 +167,13 @@ def test_gitleaks_command_pins_config_and_overrides():
     assert command[command.index("--exit-code") + 1] == str(g.LEAKS_EXIT_CODE)
     assert f"--redact={g.REDACT_PERCENT}" in command
     assert "--max-archive-depth" not in command
+    assert "--max-decode-depth" not in command
 
 
-def test_gitleaks_command_full_mode_opens_archives():
+def test_gitleaks_command_full_mode_opens_archives_and_pins_decode_depth():
     command = g.gitleaks_command("repo-1", "full")
     assert command[command.index("--max-archive-depth") + 1] == str(g.FULL_MODE_ARCHIVE_DEPTH)
+    assert command[command.index("--max-decode-depth") + 1] == str(g.FULL_MODE_DECODE_DEPTH)
 
 
 def fake_clone(ssh_url_to_repo, name):

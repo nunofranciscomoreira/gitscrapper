@@ -31,9 +31,14 @@ Clones are made over SSH, so the machine needs an SSH key GitLab accepts.
 | Mode | Scans | Cost |
 | --- | --- | --- |
 | `quick` (default) | Full history of every branch and tag in a normal clone | Baseline |
-| `full` | Everything in `quick`, plus GitLab merge-request refs (`refs/merge-requests/*/head`) and the contents of archives (zip, tar, ...) up to 2 levels deep | Larger clones, slower scans |
+| `full` | Everything in `quick`, plus GitLab merge-request refs (`refs/merge-requests/*/head`), the contents of archives (zip, tar, ...) up to 2 levels deep, and recursive decoding of percent/hex/base64-encoded text up to depth 5 | Larger clones, slower scans |
 
 Neither mode can see branches that were deleted from GitLab, since a clone never receives them.
+
+Recursive decoding (`--max-decode-depth`) is pinned explicitly in `full` mode only. gitleaks'
+own documented default for this flag isn't reliable across versions/builds (seen both `0` and
+`5`), so `quick` mode leaves it unset and inherits whatever the installed `gitleaks` binary
+defaults to.
 
 ### Hardening against repos hiding their own findings
 
@@ -104,5 +109,19 @@ sanity-check that a secret-detection regex/rule actually matches a given format
 Gitleaks 8.30.1's default rules alone only catch 24 of the 34 fixtures; `gitleaks.toml` adds 10
 custom rules (agora, alchemy, amazon-mws, amqp, anypoint, asana, a generic aws_access_key_id/
 aws_secret_access_key rule, azure management certificate, beamer, and a generic bearer token
-rule) so all 34 are now detected. If a new fixture is added or a rule's format changes, update
-both `gitleaks.toml` and the baseline in the test.
+rule). 33 of 34 fixtures are now detected; `aws.txt` is intentionally left undetected because its
+values contain the literal word "fake" (`ASIIAMFAKE...`), which both gitleaks' own
+`generic-api-key` allowlist and our `aws-credentials-generic` rule treat as an obvious placeholder
+rather than a real credential. If a new fixture is added or a rule's format changes, update both
+`gitleaks.toml` and the baseline in the test.
+
+Three of the ten custom rules (asana, beamer, bearer) are not filling a true gap in gitleaks'
+default rules — `asana-client-id`/`asana-client-secret` and `beamer-api-token` already exist, but
+require the literal word "asana"/"beamer" nearby, which these fixtures omit on purpose (only the
+*filename* names the service). Ours are intentionally looser, generic fallbacks for the same
+credential shapes without that keyword.
+
+Note: gitleaks' [README](https://github.com/gitleaks/gitleaks) states the project is feature
+complete — the maintainer is only shipping security patches now and has moved new feature work to
+a successor project ("Betterleaks"). `gitleaks.toml`'s custom rules are the only way this project
+gains new secret-format coverage going forward.
