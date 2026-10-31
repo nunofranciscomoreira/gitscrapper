@@ -1,0 +1,17 @@
+{
+  "fr": {
+    "password": "Mot de passe",
+    "confirm_password": "Confirmez le mot de passe",
+    "forgot_password": "Mot de passe oublié ?",
+    "token_expired": "Votre session a expiré, veuillez vous reconnecter."
+  },
+  "de": {
+    "password": "Passwort",
+    "new_password": "Neues Passwort",
+    "api_key": "API-Schlüssel"
+  },
+  "pt": {
+    "password": "Palavra-passe",
+    "secret_question": "Pergunta secreta"
+  }
+}

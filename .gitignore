@@ -4,3 +4,5 @@ leaks_reports/
 __pycache__/
 .venv/
 .pytest_cache/
+.scratch/
+.eval/

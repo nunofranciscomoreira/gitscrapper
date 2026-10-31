@@ -1,0 +1,141 @@
+# Pinned betterleaks config for gitscrapper. It is passed with --config so a
+# scanned repo's own .betterleaks.toml cannot replace or weaken these rules.
+title = "gitscrapper"
+minVersion = "2.0.0-rc.1"
+
+# Discards only values that are never secrets: unambiguous placeholders,
+# published documentation samples, and narrow per-rule skips tuned against the
+# benchmark in tests/test_gitscrapper.py. Deliberately no "example" term or
+# test/fixture path exclusions: real secrets turn up there too.
+filter = '''
+containsAny(lower(finding.secret), [
+    "your_api_key_here", "your-api-key-here", "yourapikeyhere",
+    "your_token_here", "your_secret_here", "your_password_here",
+    "changeme", "change_me", "replace_me",
+    "<redacted>", "[redacted]", "<your_",
+])
+// The whole value is a variable reference: ${VAR}, $(cmd), {{ .Values.x }}, %VAR%.
+|| matchesAny(finding.secret, [`^\$\{[^}]+\}$`, `^\$\(.+\)$`, `^\{\{.+\}\}$`, `^%[A-Z_]+%$`])
+// The whole value is one repeated character, or at least 80% x/X/0/* filler.
+|| entropy(finding.secret) == 0.0
+|| (len(finding.secret) - len(replace(replace(replace(replace(finding.secret, "x", ""), "X", ""), "0", ""), "*", ""))) * 5
+    >= len(finding.secret) * 4
+// Published documentation samples, by exact value: the AWS docs key pair, the
+// jwt.io token, OAuth RFC 5849/6749/6750 examples and Flask's SECRET_KEY docs.
+|| finding.secret in [
+    "AKIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "0685bd9184jfhq22",
+    "wOJIO9A2W5mFwDgiDvZbTSMK/PY=",
+    "bYT5CMsGcbgUdFHObYMEfcx6bsw=",
+    "djosJKDKJSD8743243/jdk33klY=",
+    "2YotnFZFEjr1zCsicMWpAA",
+    "tGzv3JOkF0XG5Qx2TlKWIA",
+    "mF_9.B5f-4.1JqM",
+    "5f352379324c22463451387a0aec5d2f",
+    "192b9bdd22ab9ed4d12e236c78afcb9a393ec15f71bbf5dc987d54727823bcbf",
+]
+// A dependency version under a password-named package ("pbkdf2-password": "1.2.1").
+|| (finding.rule_id == "generic-password"
+    && matchesAny(finding.secret, [`^[~^]?v?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][\w.]+)?$`]))
+// Bare credential words (password, pass#pass) in tests, examples and docs, with
+// the paths matched like generic-credential-uri's own check (and SAMPLE_PATH in
+// gitscrapper.py, which sends generic findings there to review).
+|| (finding.rule_id in ["generic-password", "generic-credential-uri"]
+    && matchesAny(attributes["path"], [
+        `(?i)(?:^|/)(?:__tests__|tests?|testdata|specs?|fixtures?|mocks?|examples?|samples?|demos?|tutorials?|docs?)(?:/|$)`,
+        `(?i)(?:^|/)readme(?:\.[^/]+)?$`,
+        `(?i)(?:^|/)[^/]*(?:[_.-](?:test|spec)|(?:test|spec)[_.-])[^/]*\.[^/]+$`,
+        `(?i)\.(?:md|mdx|rst|adoc)$`,
+    ])
+    && matchesAny(finding.secret, [
+        `(?i)^(?:pass(?:word|wd)?|pwd|secret|default)(?:(?:%[0-9a-f]{2}|[ #@:])(?:pass(?:word|wd)?|pwd|secret|default))?$`,
+    ]))
+// Overriding a default rule replaces it entirely, so skips scoped to one
+// default rule live here, guarded by finding.rule_id.
+// Translated UI labels ("password": "Mot de passe") in locale files.
+|| (finding.rule_id == "generic-password"
+    && matchesAny(attributes["path"], [
+        `(?i)(?:^|/)(?:i18n|l10n|locales?|lang|translations?)(?:/|\.(?:json|ya?ml)$)`,
+        `(?i)\.(?:po|pot|xliff|xlf|resx|arb)$`,
+    ])
+    && matchesAny(finding.secret, [`^\pL[\pL '’?!.,-]*$`]))
+// Hex digests under a hash-named key (token_sha, key_checksum, ...).
+|| (finding.rule_id == "generic-api-key"
+    && matchesAny(finding.secret, [`^[0-9a-f]{32,128}$`])
+    && matchesAny(finding.match, [`(?i)^[\w.-]*?(?:sha(?:1|256|512)?|checksum|digest|hash)['"]?[ \t]*[:=]`]))
+'''
+
+[extend]
+# Start from betterleaks' default rules, then add the custom rules below for
+# formats the default rules miss (see tests/test_gitscrapper.py for the
+# fixture baseline these were written against).
+useDefault = true
+
+[[rules]]
+id = "agora-api-key"
+description = "Agora App ID/Certificate/Secret"
+regex = '''(?i)agora_app_(?:id|certificate|secret)\s*=\s*([0-9a-f]{32})'''
+valueGroup = 1
+keywords = ["agora"]
+confidence = "high"
+
+[[rules]]
+id = "alchemy-api-key"
+description = "Alchemy API key in an alchemyapi.io URL"
+regex = '''alchemyapi\.io/v2/([A-Za-z0-9_-]{20,})'''
+valueGroup = 1
+keywords = ["alchemyapi"]
+confidence = "high"
+
+[[rules]]
+id = "amazon-mws-auth-token"
+description = "Amazon MWS auth token"
+regex = '''amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'''
+keywords = ["amzn.mws"]
+confidence = "high"
+
+[[rules]]
+id = "asana-access-token"
+description = "Asana personal access token"
+regex = '''[0-9]/(?:[0-9]{10,}:)?([0-9a-f]{32})'''
+valueGroup = 1
+keywords = ["asana"]
+confidence = "low"
+filter = 'entropy(finding.secret) <= 3.0 || failsTokenEfficiency(finding.secret)'
+
+[[rules]]
+id = "azure-management-certificate"
+description = "Azure service management certificate"
+regex = '''(?i)managementcertificate\s*=\s*([A-Za-z0-9+/=]{16,})'''
+valueGroup = 1
+keywords = ["managementcertificate"]
+confidence = "medium"
+
+[[rules]]
+id = "beamer-api-key"
+description = "Beamer API key (b_ prefixed)"
+regex = '''(?i)(?:beamer|token|api[_-]?key)[\w.-]{0,20}\s*[=:]\s*['"]?(b_[A-Za-z0-9+/_=-]{30,60})'''
+valueGroup = 1
+keywords = ["b_"]
+confidence = "low"
+filter = 'entropy(finding.secret) <= 3.5 || failsTokenEfficiency(finding.secret)'
+
+[[rules]]
+id = "bearer-token-generic"
+description = "Generic Bearer token, e.g. in an Authorization header"
+regex = '''(?i)\bbearer\s+([A-Za-z0-9_\-.=]{15,})'''
+valueGroup = 1
+keywords = ["bearer"]
+confidence = "low"
+filter = 'entropy(finding.secret) <= 3.0 || failsTokenEfficiency(finding.secret)'
+
+[[rules]]
+id = "dotnet-appsetting-secret"
+description = "Secret-named .NET appSettings entry, e.g. <add key=\"ApiSecret\" value=\"...\" />"
+regex = '''(?i)<add\s+key\s*=\s*"[\w.:-]*(?:secret|passw(?:or)?d|pwd|token|api[_.-]?key|access[_.-]?key)[\w.:-]*"\s+value\s*=\s*"([^"\s]{12,})"'''
+valueGroup = 1
+keywords = ["<add"]
+confidence = "medium"
+filter = 'entropy(finding.secret) <= 3.5 || failsTokenEfficiency(finding.secret)'

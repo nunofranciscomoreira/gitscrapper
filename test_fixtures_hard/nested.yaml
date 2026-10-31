@@ -1,0 +1,8 @@
+storage:
+  backend: s3
+  s3:
+    bucket: build-artifacts
+    region: eu-west-1
+    credentials:
+      access_key_id: AKIAXUIMYLEMFST2LSXP
+      secret_access_key: "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"

@@ -1,0 +1,1 @@
+GITLAB_TOKEN=glpat-lh9RY-xEMWtxa6jxH9zq
